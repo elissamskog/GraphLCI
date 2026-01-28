@@ -114,16 +114,10 @@ def ground_evidence(
         if not claim:
             continue
 
-        # Try document-level grounding first
-        grounded = find_quote_in_documents(claim, documents)
-        if grounded is not None:
-            results.append(grounded)
-            continue
-
-        # Try chunk-level grounding
+        # Try chunk-level grounding first for finer-grained source info (LANE C)
+        found_in_chunk = False
         if chunks:
             normalized_claim = _normalize(claim)
-            found_in_chunk = False
             for chunk in chunks:
                 normalized_text = _normalize(chunk.text)
                 if normalized_claim in normalized_text:
@@ -136,8 +130,15 @@ def ground_evidence(
                     ))
                     found_in_chunk = True
                     break
-            if found_in_chunk:
-                continue
+        
+        if found_in_chunk:
+            continue
+
+        # Try document-level grounding
+        grounded = find_quote_in_documents(claim, documents)
+        if grounded is not None:
+            results.append(grounded)
+            continue
 
         # Ungrounded: record claim with empty exact_quote
         results.append(GroundedEvidence(

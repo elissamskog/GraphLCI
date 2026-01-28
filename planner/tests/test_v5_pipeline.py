@@ -24,9 +24,10 @@ from schemas.contracts import (
     CommunityStructure,
     EmbeddedNode,
     FocusedContext,
-    GlobalContext,
-    IntentClassification,
-    IntentType,
+    GlobalContext,  # Deprecated
+    IdentifiedTargets,
+    SearchStrategyClassification,
+    SearchStrategyType,
     KnowledgeGraph,
     LaneType,
     PlannerInput,
@@ -44,12 +45,13 @@ from schemas.contracts import (
     TextChunk,
 )
 
+from planner.search_strategy_classifier import MockLLMClient
 from planner.query_embedder import embed_query
 from planner.seed_finder import find_seed_nodes
 from planner.ppr_expander import personalized_pagerank, extract_scope
 from planner.context_assembler import (
     assemble_focused_context,
-    assemble_global_context,
+    # assemble_global_context,
     assemble_targeted_context,
 )
 from planner_controller import PlannerControllerV5
@@ -415,23 +417,8 @@ def test_assemble_focused_context():
     assert ctx.scope is scope
 
 
-def test_assemble_global_context():
-    """Verify community summaries filtered to scope."""
-    graph = build_test_graph()
-    seed_ids = ["msa_n0"]  # Only MSA seed
-    scores = personalized_pagerank(graph, seed_ids)
-    scope = extract_scope(graph, scores, seed_ids, top_k=10, min_score=0.001)
-    community_structure = build_test_community_structure(graph)
-    summaries = {
-        cid: c.summary or ""
-        for cid, c in community_structure.communities.items()
-    }
+# test_assemble_global_context removed
 
-    ctx = assemble_global_context(scope, community_structure, summaries)
-    assert isinstance(ctx, GlobalContext)
-    # Should have at least the MSA community
-    assert "comm_msa" in ctx.community_summaries
-    assert ctx.scope is scope
 
 
 def test_assemble_targeted_context():
@@ -461,6 +448,7 @@ def _build_pipeline_config() -> Dict[str, Any]:
     graph = build_test_graph()
     return {
         'embedding_client': MockEmbeddingClient(),
+        'llm_client': MockLLMClient(),  # LLM client for classifier
         'seed_top_k': 5,
         'seed_threshold': 0.0,  # low threshold for tests
         'ppr_alpha': 0.85,
@@ -507,19 +495,21 @@ def test_full_pipeline():
     assert isinstance(output, PlannerOutput)
     assert isinstance(output.router_decision, RouterDecisionV5)
     assert output.router_decision.query_id == "test_q"
-    assert isinstance(output.router_decision.intent, IntentClassification)
+    assert isinstance(output.router_decision.search_strategy, SearchStrategyClassification)
     assert isinstance(output.router_decision.selected_lane, LaneType)
     assert len(output.router_decision.seed_nodes) > 0
     assert output.router_decision.scope is not None
 
-    # Exactly one context type should be populated based on lane
-    lane = output.router_decision.selected_lane
-    if lane == LaneType.LANE_A_GRAPH_LCI:
+    # Aggregator Pattern: Both contexts should be populated if data exists
+    # Lane A query
+    if output.router_decision.selected_lane == LaneType.LANE_A_GRAPH_LCI:
         assert output.focused_context is not None
-    elif lane == LaneType.LANE_B_GRAPH_ONLY:
-        assert output.global_context is not None
-    elif lane == LaneType.LANE_C_VECTOR_ONLY:
         assert output.targeted_context is not None
+    # Lane C query
+    elif output.router_decision.selected_lane == LaneType.LANE_C_VECTOR_ONLY:
+        assert output.targeted_context is not None
+        # focused_context populated if graph data available
+
 
 
 def test_pipeline_lane_a():
@@ -531,35 +521,19 @@ def test_pipeline_lane_a():
     )
 
     output = controller.process(planner_input)
-    assert output.router_decision.intent.classification == IntentType.COMPARISON
+    output = controller.process(planner_input)
+    assert output.router_decision.search_strategy.classification == SearchStrategyType.COMPARISON
     assert output.router_decision.selected_lane == LaneType.LANE_A_GRAPH_LCI
     assert output.focused_context is not None
     assert output.focused_context.documents is not None
     assert output.global_context is None
-    assert output.targeted_context is None
+    # Aggregator: Targeted context should also be populated
+    assert output.targeted_context is not None
 
 
-def test_pipeline_lane_b():
-    """SENSEMAKING query -> LANE_B -> global_context populated."""
-    config = _build_pipeline_config()
-    # Need enough documents (>5) for LANE_B routing, or adjust the
-    # routing rule: SENSEMAKING with <=5 docs -> LANE_A.
-    # Since our test graph has only 2 docs, SENSEMAKING will route to LANE_A.
-    # To test LANE_B, we build a graph with more documents.
-    graph = _build_large_test_graph(doc_count=7)
-    config['_test_graph'] = graph
 
-    controller = PlannerControllerV5(config)
-    planner_input = _build_planner_input(
-        "What are the key risk themes across all documents?", config
-    )
+# Lane B test removed
 
-    output = controller.process(planner_input)
-    assert output.router_decision.intent.classification == IntentType.SENSEMAKING
-    assert output.router_decision.selected_lane == LaneType.LANE_B_GRAPH_ONLY
-    assert output.global_context is not None
-    assert output.focused_context is None
-    assert output.targeted_context is None
 
 
 def test_pipeline_lane_c():
@@ -571,11 +545,13 @@ def test_pipeline_lane_c():
     )
 
     output = controller.process(planner_input)
-    assert output.router_decision.intent.classification == IntentType.LOOKUP
+    output = controller.process(planner_input)
+    assert output.router_decision.search_strategy.classification == SearchStrategyType.LOOKUP
     assert output.router_decision.selected_lane == LaneType.LANE_C_VECTOR_ONLY
     assert output.targeted_context is not None
-    assert output.focused_context is None
+    # focused_context can be populated if graph exists, even if Lane C chosen
     assert output.global_context is None
+
 
 
 def _build_large_test_graph(doc_count: int = 7) -> KnowledgeGraph:
@@ -620,6 +596,74 @@ def _build_large_test_graph(doc_count: int = 7) -> KnowledgeGraph:
         edge_count=len(edges),
         document_count=doc_count,
     )
+
+
+def test_aggregator_pattern_deduplication():
+    """Verify that chunks present in FocusedContext are removed from TargetedContext."""
+    config = _build_pipeline_config()
+    controller = PlannerControllerV5(config)
+    
+    # Setup graph and chunks such that there is overlap.
+    # build_test_graph() has nodes with source_chunks=['chunk_MSA_0', 'chunk_MSA_1', ...]
+    # _build_planner_input creates chunks from document_store manually in _gather_chunks 
+    # if planner_input.chunks is None.
+    # PlannerControllerV5._gather_chunks builds synthetic chunks: "chunk_{doc_id}_0"
+    
+    # To test deduplication effectively, we need the *targeted* chunks to match the *graph* chunks.
+    # Graph nodes in build_test_graph have source_chunks like "chunk_MSA_0".
+    # _gather_chunks builds "chunk_MSA_0" (position 0). 
+    
+    # Let's verify what _gather_chunks produces for 'MSA':
+    # chunk_id=f"chunk_{doc_id}_0" -> "chunk_MSA_0"
+    # graph node msa_n0 has source_chunks=["chunk_MSA_0"]
+    
+    # So overlap should happen automatically for chunk_MSA_0!
+    
+    planner_input = _build_planner_input(
+        "Does the MSA contradict DORA?", config
+    )
+    
+    output = controller.process(planner_input)
+    assert output.focused_context is not None
+    assert output.targeted_context is not None
+    
+    # Check deduplication
+    # Graph has msa_n0 which sources chunk_MSA_0.
+    # Targeted context would normally include chunk_MSA_0 because it's in the doc store.
+    
+    # Inspect targeted chunks
+    t_chunk_ids = [c.chunk.chunk_id for c in output.targeted_context.chunks]
+    
+    # Verify that 'chunk_MSA_0' is NOT in targeted chunks (deduplicated)
+    # But wait, does scope include msa_n0?
+    # Scope depends on PPR. msa_n0 is a seed (exact match for "MSA Liability Cap" logic in tests? no query is "Does MSA contradict...")
+    # In test_full_pipeline, we see seeds found.
+    # Let's ensure msa_n0 is in scope. 
+    # The query "Does the MSA contradict DORA?" might not hit msa_n0 ("Liability Cap") directly unless embedding matches.
+    # But PPR expands.
+    
+    # If msa_n0 is in scope, then chunk_MSA_0 must be removed from targeted.
+    
+    # Let's verify if *any* deduplication happened.
+    # If no deduplication, targeted chunks would be all chunks.
+    
+    # Manually check scope nodes to see what should be removed
+    scope_node_ids = set(output.router_decision.scope.nodes.keys())
+    # Retrieve covering chunks from graph
+    covered_chunks = set()
+    graph = planner_input.graph
+    for nid in scope_node_ids:
+        node = graph.nodes.get(nid)
+        if node and hasattr(node, "source_chunks"):
+             for cid in node.source_chunks:
+                 covered_chunks.add(cid)
+                 
+    # Assert that none of covered_chunks are in targeted_context
+    for tc in output.targeted_context.chunks:
+        assert tc.chunk.chunk_id not in covered_chunks, f"Chunk {tc.chunk.chunk_id} should have been deduplicated!"
+        
+    print(f"\\nAggregator Deduplication Verified: Removed {len(covered_chunks)} overlapping chunks from targeted context.")
+
 
 
 # ============================================================================

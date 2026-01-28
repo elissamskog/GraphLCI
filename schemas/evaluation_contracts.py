@@ -18,7 +18,7 @@ from enum import Enum
 
 from schemas.contracts import (
     GraphEdge,
-    IntentType,
+    SearchStrategyType,
     LaneType,
     MetricScore,
     QueryRequest,
@@ -66,7 +66,7 @@ class GroundTruthCase:
     expected_relationship_type: Optional[str]
     expected_relationship_direction: Optional[str]   # "DORA -> MSA"
     expected_contradiction: Optional[str]
-    expected_intent: IntentType
+    expected_strategy: SearchStrategyType
     expected_lane: LaneType
     is_synthetic: bool
 
@@ -78,7 +78,7 @@ class GroundTruthResult:
     domain_match: bool
     relationship_type_match: Optional[bool]
     relationship_direction_match: Optional[bool]
-    intent_match: bool
+    strategy_match: bool
     lane_match: bool
     details: Dict[str, Any]
 
@@ -334,7 +334,7 @@ class V5GroundTruthCase:
     expected_verdict: VerdictType
     expected_relationship: EpistemicRelationship
     expected_lane: LaneType
-    expected_intent: IntentType
+    expected_strategy: SearchStrategyType
     is_synthetic: bool
     gold_doc_ids: Optional[List[str]] = None
 
@@ -346,7 +346,9 @@ class V5GroundTruthResult:
     verdict_match: bool
     relationship_match: bool
     lane_match: bool
-    intent_match: bool
+    relationship_match: bool
+    lane_match: bool
+    strategy_match: bool
     details: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -355,7 +357,7 @@ class V5GroundTruthResult:
             self.verdict_match
             and self.relationship_match
             and self.lane_match
-            and self.intent_match
+            and self.strategy_match
         )
 
 
@@ -487,7 +489,7 @@ class WikiClaimResult:
     trace_scope_nodes: int = 0
     trace_scope_documents: int = 0
     trace_selected_lane: str = ""
-    trace_intent: str = ""
+    trace_search_strategy: str = ""
     trace_router_confidence: float = 0.0
     trace_ppr_total_mass: float = 0.0
     # --- Reasoner trace ---
@@ -584,7 +586,7 @@ class ClaimTraceData:
     scope_nodes: int = 0
     scope_documents: int = 0
     selected_lane: str = ""
-    intent: str = ""
+    search_strategy: str = ""
     router_confidence: float = 0.0
     ppr_total_mass: float = 0.0
     seed_details: List[Dict[str, Any]] = field(default_factory=list)
@@ -653,7 +655,7 @@ class UnifiedClaimResult:
     evidence_doc_recall: float = 0.0
     scope_recall: float = 0.0
     lane_used: str = ""
-    intent: str = ""
+    search_strategy: str = ""
     relationships: List[str] = field(default_factory=list)
     error: Optional[str] = None
     trace: ClaimTraceData = field(default_factory=ClaimTraceData)

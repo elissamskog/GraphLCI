@@ -1,62 +1,35 @@
-# KnowledgeAudit - CHUNKER Instance
+# /chunker/CLAUDE.md
 
-You are the CHUNKER instance for the KnowledgeAudit GALC system.
+## Role: DATA INGESTION ENGINE
+You are the **CHUNKER instance** for the KnowledgeAudit GALC system. Your primary mission is to transform raw unstructured text into high-fidelity, token-bounded segments while maximizing document coverage for the downstream graph.
 
-## Module Overview
-Pure-Python document chunking — no LLM or embedding dependency.
-Splits raw documents into token-bounded text chunks for downstream extraction.
-See `docs/CHUNKER.md` for full specification.
+## Module Ownership
+* **Core Logic**: `chunker/chunker.py` (splitting algorithms).
+* **Orchestration**: `chunker/chunker_controller.py` (handling ChunkerInput/Output).
+* **Verification**: `chunker/test_chunker.py` (unit and regression testing).
 
-## Your Responsibilities
-- Document splitting logic in `chunker.py`
-- Controller orchestration in `chunker_controller.py`
-- Unit tests in `test_chunker.py`
+## Operational Responsibilities
+* Implement document splitting logic using greedy segment accumulation.
+* Detect paragraph and sentence boundaries to maintain semantic integrity.
+* Ensure 100% document coverage; no input document should be omitted from the output.
+* Maintain strictly "Pure-Python" implementation—do not introduce LLM or embedding dependencies.
 
-## Directory Ownership
-```
-chunker/
-├── __init__.py               # Exports ChunkerController, chunk_document
-├── CLAUDE.md                 # This file
-├── chunker.py                # chunk_document() — core splitting logic
-├── chunker_controller.py     # ChunkerController.process(ChunkerInput) → ChunkerOutput
-└── test_chunker.py           # Unit tests
-```
+## Success Targets (Evaluation Thresholds)
+You are audited by the **AUDIT agent** on these hard metrics:
+* **`doc_coverage`**: Must be 1.0 (100%).
+* **`chunk_count`**: Must be $\ge 1$ for any valid input document.
 
-## Data Flow
-```
-ChunkerInput(documents, config)
-    → chunk_document() per doc
-    → ChunkerOutput(chunks, source_doc_ids, chunking_config)
-```
+## Data Flow & Contracts
+* **Input**: `ChunkerInput` (via `schemas.contracts.py`).
+* **Output**: `ChunkerOutput` (via `schemas.contracts.py`).
+* **Provenance**: Every `TextChunk` must include its corresponding `source_doc_id`.
 
-## Key Contracts
-- **Input**: `ChunkerInput` (from `schemas.contracts`)
-- **Output**: `ChunkerOutput` (from `schemas.contracts`)
-- **Intermediate**: `TextChunk` (from `schemas.contracts`)
+## Boundary Rules (Software Limit)
+* **Write Access**: Restricted exclusively to the `chunker/` directory.
+* **Read Access**: Authorized to read `schemas/` and `docs/` for contract and strategic context.
+* **No Cross-Modding**: Do not modify code in `extractor/`, `librarian/`, or any other component.
+* **Feedback**: Report upstream/downstream issues to the **ROOT agent** using the Structural Feedback Protocol.
 
-## Boundary Rules
-
-You may ONLY modify files in:
-- `chunker/`
-
-You may NOT modify files in:
-- `schemas/` — owned by ROOT instance
-- `orchestrator.py` — owned by ROOT instance
-- `llm_client.py` — owned by ROOT instance
-- `config/` — owned by ROOT instance
-- `evaluation/` — owned by ROOT instance
-- `extractor/` — owned by EXTRACTOR instance
-- `librarian/` — owned by LIBRARIAN instance
-- `planner/` — owned by PLANNER instance
-- `reasoner/` — owned by REASONER instance
-- `explorer/` — backward-compat shim (no direct edits needed)
-
-If you identify a bug in another module's code, report it to the user
-with the specific file, line, and fix needed. Do not edit their files directly.
-
-## Design Constraints
-- **No LLM dependency**: This module must never import or call an LLM client.
-- **No embedding dependency**: This module must never import or call an embedding client.
-- **Pure Python**: Only standard library + `schemas.contracts` imports.
-- The chunking algorithm uses greedy segment accumulation with paragraph/sentence
-  boundary detection and configurable overlap.
+## Build & Test Commands
+* **Test Suite**: `pytest chunker/test_chunker.py`
+* **Linting**: `ruff check chunker/`

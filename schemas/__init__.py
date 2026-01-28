@@ -3,7 +3,7 @@ from schemas.contracts import (
     LLMClient,
     EmbeddingClient,
     # Enumerations
-    IntentType,
+    SearchStrategyType,
     LaneType,
     DomainType,
     EdgeType,
@@ -30,7 +30,7 @@ from schemas.contracts import (
     ExtractionMetadata,
     IndexedCorpus,
     # Output contracts - Planner
-    IntentClassification,
+    SearchStrategyClassification,
     IdentifiedTargets,
     RouterDecision,
     # Output contracts - Resolver
@@ -117,7 +117,7 @@ __all__ = [
     "LLMClient",
     "EmbeddingClient",
     # Enumerations
-    "IntentType",
+    "SearchStrategyType",
     "LaneType",
     "DomainType",
     "EdgeType",
@@ -144,7 +144,7 @@ __all__ = [
     "ExtractionMetadata",
     "IndexedCorpus",
     # Output contracts - Planner
-    "IntentClassification",
+    "SearchStrategyClassification",
     "IdentifiedTargets",
     "RouterDecision",
     # Output contracts - Resolver

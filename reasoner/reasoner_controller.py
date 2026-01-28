@@ -41,8 +41,8 @@ from schemas.contracts import (
 
 from reasoner.prompt_builder import (
     build_focused_prompt,
-    build_global_prompt,
     build_targeted_prompt,
+    build_hybrid_prompt,
 )
 from reasoner.epistemic_extractor import extract_relationships
 from reasoner.evidence_grounder import ground_evidence
@@ -117,7 +117,7 @@ class ReasonerController:
             evidence=[],
             scope=scope_summary,
             lane_used=selected_lane.value,
-            intent_classified=input.router_decision.intent.classification.value,
+            search_strategy=input.router_decision.search_strategy.classification.value,
             confidence_factors=confidence_factors,
             reasoning_trace="Empty context detected — no LLM call made.",
         )
@@ -126,7 +126,7 @@ class ReasonerController:
             trace_id=str(uuid4()),
             query_id=input.query_id,
             lane_used=selected_lane.value,
-            intent=input.router_decision.intent.classification.value,
+            search_strategy=input.router_decision.search_strategy.classification.value,
             documents_in_scope=0,
             relationships_inferred=0,
             evidence_grounded=0,
@@ -148,11 +148,12 @@ class ReasonerController:
         """Run the full REASONER pipeline.
 
         Steps:
-        1. Build prompt from context (focused/global/targeted)
+        1. Build hybrid prompt from available contexts (LANE_A + LANE_C)
         2. Call LLM for epistemic analysis
         3. Extract relationships from response
-        4. Ground evidence to source documents
+        4. Ground evidence to source documents/chunks
         5. Determine verdict and confidence
+        6. Apply Epistemic Calibration
 
         Returns
         -------
@@ -162,30 +163,20 @@ class ReasonerController:
         start_time = time.time()
         selected_lane = input.router_decision.selected_lane
 
-        # --- Step 1: Build prompt based on lane ---
-        if selected_lane == LaneType.LANE_A_GRAPH_LCI:
-            prompt = build_focused_prompt(input.query, input.focused_context)
-        elif selected_lane == LaneType.LANE_B_GRAPH_ONLY:
-            prompt = build_global_prompt(input.query, input.global_context)
-        else:  # LANE_C_VECTOR_ONLY
-            prompt = build_targeted_prompt(input.query, input.targeted_context)
+        # --- Step 1: Build Hybrid Prompt ---
+        # We always synthesize focused (A) and targeted (C) if available
+        prompt = build_hybrid_prompt(
+            input.query,
+            focused=input.focused_context,
+            targeted=input.targeted_context
+        )
 
         # --- Guard: detect empty context before calling LLM ---
-        empty = False
-        if selected_lane == LaneType.LANE_A_GRAPH_LCI:
-            if not input.focused_context or not input.focused_context.documents:
-                logger.warning("Lane A: 0 documents for query: %.80s", input.query.query_text)
-                empty = True
-        elif selected_lane == LaneType.LANE_B_GRAPH_ONLY:
-            if not input.global_context or not input.global_context.community_summaries:
-                logger.warning("Lane B: 0 community summaries for query: %.80s", input.query.query_text)
-                empty = True
-        else:  # LANE_C_VECTOR_ONLY
-            if not input.targeted_context or not input.targeted_context.chunks:
-                logger.warning("Lane C: 0 chunks for query: %.80s", input.query.query_text)
-                empty = True
+        has_focused = input.focused_context is not None and bool(input.focused_context.documents)
+        has_targeted = input.targeted_context is not None and bool(input.targeted_context.chunks)
 
-        if empty:
+        if not has_focused and not has_targeted:
+            logger.warning("Hybrid Reasoner: 0 context for query: %.80s", input.query.query_text)
             return self._empty_context_output(input, selected_lane, start_time)
 
         # --- Step 2: Call LLM ---
@@ -201,14 +192,14 @@ class ReasonerController:
         chunks: Optional[List[TextChunk]] = None
         scope: Optional[Scope] = None
 
-        if selected_lane == LaneType.LANE_A_GRAPH_LCI and input.focused_context:
+        if input.focused_context:
             documents = input.focused_context.documents
             scope = input.focused_context.scope
-        elif selected_lane == LaneType.LANE_B_GRAPH_ONLY and input.global_context:
-            scope = input.global_context.scope
-        elif selected_lane == LaneType.LANE_C_VECTOR_ONLY and input.targeted_context:
+        
+        if input.targeted_context:
             chunks = [rc.chunk for rc in input.targeted_context.chunks]
-            scope = input.targeted_context.scope
+            if not scope:
+                scope = input.targeted_context.scope
 
         # --- Step 5: Gather claims for grounding ---
         claims: List[str] = []
@@ -226,13 +217,30 @@ class ReasonerController:
         # --- Step 6: Ground evidence ---
         evidence = ground_evidence(claims, documents, chunks)
 
-        # --- Step 7: Resolve verdict ---
+        # --- Step 7: Determine verdict type ---
         verdict_type = determine_verdict_type(relationships, evidence)
 
-        # --- Step 8: Calculate confidence ---
+        # --- Step 8: Calculate raw confidence ---
         confidence_factors = calculate_confidence(relationships, evidence)
+        final_confidence = confidence_factors.overall
 
-        # --- Step 9: Build Verdict ---
+        # --- Step 9: Epistemic Calibration ---
+        # Cap confidence if claim is temporal/relational but only has LANE_C evidence
+        temporal_relational_types = {
+            EpistemicRelationship.PRECEDES,
+            EpistemicRelationship.SUPERSEDES,
+            EpistemicRelationship.EXTENDS,
+        }
+        has_temporal_relational = any(
+            rel.relationship in temporal_relational_types for rel in relationships
+        )
+
+        if has_temporal_relational and not has_focused and has_targeted:
+            # Cap confidence at 0.4 for temporal/relational claims lacking structural evidence
+            final_confidence = min(final_confidence, 0.4)
+            logger.info("Epistemic Calibration: Capped confidence for temporal claim without Lane A.")
+
+        # --- Step 10: Build Verdict ---
         verdict_block = parsed.get("verdict", {})
         answer = verdict_block.get("answer", "")
         summary = verdict_block.get("summary", "")
@@ -245,15 +253,15 @@ class ReasonerController:
         verdict = Verdict(
             verdict_type=verdict_type,
             answer=answer,
-            confidence=confidence_factors.overall,
+            confidence=final_confidence,
             summary=summary,
             primary_relationship=primary_relationship,
         )
 
-        # --- Step 10: Build ScopeSummary ---
+        # --- Step 11: Build ScopeSummary ---
         if scope:
             bridge_count = sum(
-                1 for e in scope.edges.values() if e.is_cross_document
+                1 for e in scope.edges.values() if getattr(e, "is_cross_document", False)
             )
             scope_summary = ScopeSummary(
                 document_ids=scope.document_ids,
@@ -271,10 +279,10 @@ class ReasonerController:
                 bridge_edges_used=0,
             )
 
-        # --- Step 11: Extract reasoning trace ---
+        # --- Step 12: Extract reasoning trace ---
         reasoning_trace = parsed.get("reasoning_trace", "")
 
-        # --- Step 12: Build Finding ---
+        # --- Step 13: Build Finding ---
         total_time_ms = (time.time() - start_time) * 1000
 
         finding = Finding(
@@ -286,22 +294,22 @@ class ReasonerController:
             evidence=evidence,
             scope=scope_summary,
             lane_used=selected_lane.value,
-            intent_classified=input.router_decision.intent.classification.value,
+            search_strategy=input.router_decision.search_strategy.classification.value,
             confidence_factors=confidence_factors,
             reasoning_trace=reasoning_trace,
         )
 
-        # --- Step 13: Build ReasonerTrace ---
+        # --- Step 14: Build ReasonerTrace ---
         trace = ReasonerTrace(
             trace_id=str(uuid4()),
             query_id=input.query_id,
             lane_used=selected_lane.value,
-            intent=input.router_decision.intent.classification.value,
+            search_strategy=input.router_decision.search_strategy.classification.value,
             documents_in_scope=scope_summary.document_count,
             relationships_inferred=len(relationships),
             evidence_grounded=sum(1 for e in evidence if e.exact_quote),
             verdict_type=verdict_type.value,
-            verdict_confidence=confidence_factors.overall,
+            verdict_confidence=final_confidence,
             llm_time_ms=llm_time_ms,
             total_time_ms=total_time_ms,
             final_prompt=prompt,

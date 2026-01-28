@@ -32,10 +32,10 @@ class LLMClient(Protocol):
 # ENUMERATIONS
 # ============================================================================
 
-class IntentType(Enum):
-    """Query intent classification."""
+class SearchStrategyType(Enum):
+    """Query search strategy (formerly IntentType)."""
     COMPARISON = "COMPARISON"
-    SENSEMAKING = "SENSEMAKING"
+    # SENSEMAKING = "SENSEMAKING"  <-- RETIRED
     LOOKUP = "LOOKUP"
     CLAIM_VERIFICATION = "CLAIM_VERIFICATION"
     CONTRADICTION_DETECTION = "CONTRADICTION_DETECTION"
@@ -46,7 +46,7 @@ class IntentType(Enum):
 class LaneType(Enum):
     """Processing lane selection."""
     LANE_A_GRAPH_LCI = "LANE_A_GRAPH_LCI"
-    LANE_B_GRAPH_ONLY = "LANE_B_GRAPH_ONLY"
+    # LANE_B_GRAPH_ONLY = "LANE_B_GRAPH_ONLY" <-- RETIRED
     LANE_C_VECTOR_ONLY = "LANE_C_VECTOR_ONLY"
 
 
@@ -210,6 +210,7 @@ class AssemblyRequest:
 # ============================================================================
 
 @dataclass
+@dataclass
 class GraphNode:
     """Node in the knowledge graph."""
     node_id: str
@@ -272,9 +273,9 @@ class IndexedCorpus:
 
 
 @dataclass
-class IntentClassification:
-    """Intent analysis result."""
-    classification: IntentType
+class SearchStrategyClassification:
+    """Search strategy analysis result (formerly IntentClassification)."""
+    classification: SearchStrategyType
     confidence: float
     reasoning: str
 
@@ -290,7 +291,7 @@ class IdentifiedTargets:
 class RouterDecision:
     """Output from PLANNER."""
     query_id: str
-    intent: IntentClassification
+    search_strategy: SearchStrategyClassification  # formerly intent
     selected_lane: LaneType
     requires_graph_scope: bool
     identified_targets: IdentifiedTargets
@@ -849,7 +850,10 @@ class FocusedContext:  # v5
 
 @dataclass
 class GlobalContext:  # v5
-    """Context for Lane B (Graph-only) queries."""
+    """
+    [DEPRECATED] Context for Lane B (Graph-only) queries.
+    Retained for backward compatibility.
+    """
     community_summaries: Dict[str, str]
     scope: Scope
 
@@ -872,7 +876,7 @@ class TargetedContext:  # v5
 class RouterDecisionV5:  # v5
     """Router decision with v5 fields."""
     query_id: str
-    intent: IntentClassification
+    search_strategy: SearchStrategyClassification  # formerly intent
     selected_lane: LaneType
     seed_nodes: List[SeedNode]
     scope: Optional[Scope] = None
@@ -905,7 +909,7 @@ class PlannerTrace:  # v5
     """Trace/telemetry from a PLANNER run."""
     trace_id: str
     query_id: str
-    intent_classification: str
+    search_strategy: str
     seeds_found: int
     ppr_iterations: int
     scope_nodes: int
@@ -968,7 +972,6 @@ class ConfidenceFactors:  # v5
     source_agreement: float
     coverage: float
 
-
 @dataclass
 class Finding:  # v5
     """Complete finding produced by the REASONER."""
@@ -980,10 +983,9 @@ class Finding:  # v5
     evidence: List[GroundedEvidence]
     scope: ScopeSummary
     lane_used: str
-    intent_classified: str
+    search_strategy: str
     confidence_factors: ConfidenceFactors
     reasoning_trace: str
-
 
 @dataclass
 class ReasonerInput:  # v5
@@ -1003,14 +1005,13 @@ class ReasonerOutput:  # v5
     trace: ReasonerTrace
     raw_response: str
 
-
 @dataclass
 class ReasonerTrace:  # v5
     """Trace/telemetry from a REASONER run."""
     trace_id: str
     query_id: str
     lane_used: str
-    intent: str
+    search_strategy: str
     documents_in_scope: int
     relationships_inferred: int
     evidence_grounded: int
@@ -1018,7 +1019,7 @@ class ReasonerTrace:  # v5
     verdict_confidence: float
     llm_time_ms: float
     total_time_ms: float
-    final_prompt: Optional[str] = None        # populated by REASONER module
+    final_prompt: Optional[str] = None
     prompt_token_count: Optional[int] = None
 
 

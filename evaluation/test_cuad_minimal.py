@@ -89,8 +89,8 @@ def main() -> None:
     print(f"\nRouterDecision:")
     print(f"  Lane:            {router_decision.selected_lane.value}")
     print(f"  Graph scope:     {router_decision.requires_graph_scope}")
-    print(f"  Intent:          {router_decision.intent.classification.value} "
-          f"(conf={router_decision.intent.confidence})")
+    print(f"  Strategy:        {router_decision.search_strategy.classification.value} "
+          f"(conf={router_decision.search_strategy.confidence})")
     print(f"  Targets:         docs={router_decision.identified_targets.explicit_docs}, "
           f"entities={router_decision.identified_targets.implicit_entities}")
     print(f"  Domain:          {router_decision.domain_expectation.value}")

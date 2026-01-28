@@ -78,11 +78,32 @@ def personalized_pagerank(
         total = sum(w for _, w in adj.get(node_id, []))
         out_weight[node_id] = total if total > 0 else 1.0
 
-    # Personalization vector: uniform over valid seeds
-    seed_weight = 1.0 / len(valid_seeds)
+    # Personalization vector: weighted by node specificity s_i = 1 / |P_i|
+    # Rare nodes (fewer chunks) get higher initial weight.
     personal: Dict[str, float] = defaultdict(float)
+    total_specificity = 0.0
+    
     for s in valid_seeds:
-        personal[s] = seed_weight
+        node = graph.nodes.get(s)
+        # Default to 1 chunk if unknown or empty (though valid_seeds ensures presence in graph.nodes mostly, 
+        # but graph.nodes might differ from graph.adjacency keys if data is messy. 
+        # The 'valid_seeds' check above checked graph.nodes presence? 
+        # No, it checked 'if s in graph.nodes'. So node should exist.)
+        chunk_count = len(node.source_chunks) if node else 1
+        # Specificity s_i
+        w = 1.0 / max(chunk_count, 1)
+        personal[s] = w
+        total_specificity += w
+
+    # Normalize so sum(personal) = 1.0
+    if total_specificity > 0:
+        for s in valid_seeds:
+            personal[s] /= total_specificity
+    else:
+        # Fallback to uniform if something went wrong
+        uniform_w = 1.0 / len(valid_seeds)
+        for s in valid_seeds:
+            personal[s] = uniform_w
 
     # Initialize scores to personalization vector
     scores: Dict[str, float] = {n: personal.get(n, 0.0) for n in all_nodes}

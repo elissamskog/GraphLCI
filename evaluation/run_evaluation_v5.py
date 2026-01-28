@@ -717,7 +717,7 @@ def run_single_claim(
         result.correct = result.mapped_verdict == claim.expected_verdict
         result.confidence = finding.verdict.confidence
         result.lane_used = finding.lane_used
-        result.intent = finding.intent_classified
+        result.search_strategy = finding.search_strategy
         result.evidence_doc_ids = [
             str(ev.source_document) for ev in finding.evidence if ev.source_document
         ]
@@ -737,9 +737,9 @@ def run_single_claim(
             rd = planner_out.router_decision
             trace.seeds_found = len(rd.seed_nodes)
             trace.selected_lane = rd.selected_lane.value if rd.selected_lane else ""
-            trace.intent = (
-                rd.intent.classification.value
-                if rd.intent and rd.intent.classification else ""
+            trace.search_strategy = (
+                rd.search_strategy.classification.value
+                if rd.search_strategy and rd.search_strategy.classification else ""
             )
             trace.router_confidence = rd.confidence
             if rd.scope:
@@ -1085,6 +1085,7 @@ def build_summary(
         sum(r.scope_recall for r in completed) / len(completed)
         if completed else 0.0
     )
+    
     mean_confidence = (
         sum(r.confidence for r in completed) / len(completed)
         if completed else 0.0
@@ -1391,7 +1392,7 @@ def format_output_md(summary: UnifiedRunSummary, adapter: DatasetAdapter) -> str
                     f"lane={t.selected_lane} "
                     f"ppr_mass={t.ppr_total_mass:.2f} "
                     f"router_conf={t.router_confidence:.2f} "
-                    f"intent={t.intent}"
+                    f"search_strategy={t.search_strategy}"
                 )
                 lines.append(
                     f"- **Reasoner:** docs={t.docs_in_scope} "
@@ -1727,7 +1728,7 @@ def write_trace_json(
                 "scope_nodes": t.scope_nodes,
                 "scope_documents": t.scope_documents,
                 "selected_lane": t.selected_lane,
-                "intent": t.intent,
+                "search_strategy": t.search_strategy,
             }
             reasoner_trace: Dict[str, Any] = {
                 "docs_in_scope": t.docs_in_scope,
@@ -1790,7 +1791,7 @@ def write_trace_json(
                 "correct": r.correct,
                 "confidence": r.confidence,
                 "lane": r.lane_used,
-                "intent": r.intent,
+                "search_strategy": r.search_strategy,
                 "evidence_doc_ids": r.evidence_doc_ids,
                 "expected_doc_ids": r.expected_doc_ids,
                 "evidence_doc_recall": r.evidence_doc_recall,
@@ -1848,14 +1849,14 @@ def write_checkpoint(
                 "correct": r.correct,
                 "confidence": r.confidence,
                 "lane": r.lane_used,
-                "intent": r.intent,
+                "search_strategy": r.search_strategy,
                 "evidence_doc_recall": r.evidence_doc_recall,
                 "scope_recall": r.scope_recall,
                 "trace_seeds_found": t.seeds_found,
                 "trace_scope_nodes": t.scope_nodes,
                 "trace_scope_documents": t.scope_documents,
                 "trace_selected_lane": t.selected_lane,
-                "trace_intent": t.intent,
+                "trace_search_strategy": t.search_strategy,
                 "trace_docs_in_scope": t.docs_in_scope,
                 "trace_total_time_ms": t.total_time_ms,
                 "trace_confidence_overall": t.confidence_overall,

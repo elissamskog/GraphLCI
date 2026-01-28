@@ -10,6 +10,7 @@ glean missed items, resolve coreferences, embed nodes.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -32,6 +33,8 @@ from extractor.claim_extractor import extract_claims
 from extractor.gleaner import glean_missing
 from extractor.coreference_resolver import resolve_coreferences
 from extractor.node_embedder import embed_nodes, NodeDescriptor
+
+logger = logging.getLogger("knowledgeaudit.extractor")
 
 
 class ExtractorController:
@@ -349,6 +352,7 @@ class ExtractorController:
 
         except Exception as e:
             # Return minimal valid output with error info and partial trace
+            logger.critical("EXTRACTOR PIPELINE CRITICAL FAILURE: %s", str(e), exc_info=True)
             elapsed = time.monotonic() - t0
             error_trace = ExtractorTrace(
                 trace_id=str(uuid.uuid4()),

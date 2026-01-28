@@ -18,11 +18,11 @@ from schemas.contracts import (
     EmbeddedNode,
     EpistemicRelationship,
     FocusedContext,
-    GlobalContext,
+    # GlobalContext,
     GroundedEvidence,
     InferredRelationship,
-    IntentClassification,
-    IntentType,
+    SearchStrategyClassification,
+    SearchStrategyType,
     LaneType,
     QueryRequest,
     RankedChunk,
@@ -41,7 +41,7 @@ from schemas.contracts import (
 
 from reasoner.prompt_builder import (
     build_focused_prompt,
-    build_global_prompt,
+    # build_global_prompt,
     build_targeted_prompt,
 )
 from reasoner.epistemic_extractor import extract_relationships
@@ -81,32 +81,8 @@ MOCK_FOCUSED_RESPONSE = json.dumps({
     "reasoning_trace": "Step 1: Compared clauses. Step 2: Found contradiction."
 })
 
-MOCK_GLOBAL_RESPONSE = json.dumps({
-    "relationships": [
-        {
-            "source_id": "community_1",
-            "target_id": "community_2",
-            "relationship": "SUPPORTS",
-            "confidence": 0.85,
-            "reasoning": "Both communities agree on term definitions",
-            "evidence_quote": "Term definitions are consistent"
-        }
-    ],
-    "evidence": [
-        {
-            "claim": "Term consistency across documents",
-            "source_document": "community_1",
-            "exact_quote": "Term definitions are consistent"
-        }
-    ],
-    "verdict": {
-        "verdict_type": "CONFIRMED",
-        "answer": "Definitions are consistent across communities",
-        "confidence": 0.85,
-        "summary": "Community summaries show consistent definitions."
-    },
-    "reasoning_trace": "Analyzed themes across communities."
-})
+# MOCK_GLOBAL_RESPONSE removed
+
 
 MOCK_TARGETED_RESPONSE = json.dumps({
     "relationships": [
@@ -243,21 +219,8 @@ def make_focused_context() -> FocusedContext:
     )
 
 
-def make_global_context() -> GlobalContext:
-    scope = Scope(
-        nodes={},
-        edges={},
-        document_ids=["doc_1", "doc_2"],
-        seed_node_ids=[],
-        total_ppr_mass=0.0,
-    )
-    return GlobalContext(
-        community_summaries={
-            "community_1": "Documents discuss liability caps and limitations.",
-            "community_2": "Regulatory requirements mandate unlimited liability for certain breaches.",
-        },
-        scope=scope,
-    )
+# make_global_context removed
+
 
 
 def make_targeted_context() -> TargetedContext:
@@ -298,8 +261,8 @@ def make_targeted_context() -> TargetedContext:
 def make_router_decision(lane: LaneType) -> RouterDecisionV5:
     return RouterDecisionV5(
         query_id="test-query-001",
-        intent=IntentClassification(
-            classification=IntentType.CONTRADICTION_DETECTION,
+        search_strategy=SearchStrategyClassification(
+            classification=SearchStrategyType.CONTRADICTION_DETECTION,
             confidence=0.95,
             reasoning="Query asks about contradictions between documents",
         ),
@@ -315,7 +278,7 @@ def make_reasoner_input(lane: LaneType) -> ReasonerInput:
         query_id="test-query-001",
         router_decision=make_router_decision(lane),
         focused_context=make_focused_context() if lane == LaneType.LANE_A_GRAPH_LCI else None,
-        global_context=make_global_context() if lane == LaneType.LANE_B_GRAPH_ONLY else None,
+        global_context=None, # Lane B retired
         targeted_context=make_targeted_context() if lane == LaneType.LANE_C_VECTOR_ONLY else None,
     )
 
@@ -336,12 +299,8 @@ def test_prompt_builder():
     assert "Liability shall not exceed" in focused
     assert "REFERENCES" in focused  # edge grammar content
 
-    # Global prompt
-    global_prompt = build_global_prompt(query, make_global_context())
-    assert isinstance(global_prompt, str) and len(global_prompt) > 0
-    assert query.query_text in global_prompt
-    assert "community_1" in global_prompt
-    assert "liability caps" in global_prompt.lower()
+    # Global prompt test removed
+
 
     # Targeted prompt
     targeted = build_targeted_prompt(query, make_targeted_context())
@@ -486,13 +445,18 @@ def test_verdict_resolver():
     ]
     assert determine_verdict_type(rels_partial_refuted, evidence) == VerdictType.PARTIALLY_REFUTED
 
-    # CONFIRMED: more supports with >= 2 strong supports
-    rels_confirmed = [
-        InferredRelationship("a", "b", EpistemicRelationship.SUPPORTS, 0.9, "r1"),
-        InferredRelationship("a", "c", EpistemicRelationship.STRONGLY_SUPPORTS, 0.95, "r2"),
-        InferredRelationship("a", "d", EpistemicRelationship.SUPPORTS, 0.85, "r3"),
+    # CONFIRMED: more supports with >= 2 strong supports AND linked structural evidence
+    # Hybrid rule requires evidence_quote on a relationship to match an evidence's exact_quote + source_chunk
+    linked_evidence = [
+        GroundedEvidence(claim="test", source_document="doc_1", source_chunk="chunk_1", exact_quote="linked_quote"),
     ]
-    assert determine_verdict_type(rels_confirmed, evidence) == VerdictType.CONFIRMED
+    rels_confirmed = [
+        InferredRelationship("a", "b", EpistemicRelationship.SUPPORTS, 0.9, "r1", evidence_quote=None),
+        InferredRelationship("a", "c", EpistemicRelationship.STRONGLY_SUPPORTS, 0.95, "r2", evidence_quote="linked_quote"),  # Linked!
+        InferredRelationship("a", "d", EpistemicRelationship.SUPPORTS, 0.85, "r3", evidence_quote=None),
+    ]
+    assert determine_verdict_type(rels_confirmed, linked_evidence) == VerdictType.CONFIRMED
+
 
     # PARTIALLY_CONFIRMED: more supports but < 2 strong supports
     rels_partial_confirmed = [
@@ -589,7 +553,7 @@ def test_full_pipeline():
 
     # Lane and intent
     assert finding.lane_used == "LANE_A_GRAPH_LCI"
-    assert finding.intent_classified == "CONTRADICTION_DETECTION"
+    assert finding.search_strategy == "CONTRADICTION_DETECTION"
 
     print("  PASSED: test_full_pipeline")
 

@@ -8,7 +8,7 @@ document pairs from v4 fixtures but uses v5-specific expectations:
 - expected_verdict (VerdictType)
 - expected_relationship (EpistemicRelationship)
 - expected_lane (LaneType)
-- expected_intent (IntentType)
+- expected_strategy (SearchStrategyType)
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from schemas.contracts import (
     EpistemicRelationship,
-    IntentType,
+    SearchStrategyType,
     LaneType,
     QueryRequest,
     RawDocument,
@@ -74,7 +74,7 @@ V5_SYNTH_01 = V5GroundTruthCase(
     expected_verdict=VerdictType.CONFIRMED,
     expected_relationship=EpistemicRelationship.CONTRADICTS,
     expected_lane=LaneType.LANE_A_GRAPH_LCI,
-    expected_intent=IntentType.COMPARISON,
+    expected_strategy=SearchStrategyType.COMPARISON,
     is_synthetic=True,
     gold_doc_ids=["MSA", "DORA"],
 )
@@ -115,7 +115,7 @@ V5_SYNTH_02 = V5GroundTruthCase(
     expected_verdict=VerdictType.REFUTED,
     expected_relationship=EpistemicRelationship.SUPPORTS,
     expected_lane=LaneType.LANE_A_GRAPH_LCI,
-    expected_intent=IntentType.COMPARISON,
+    expected_strategy=SearchStrategyType.COMPARISON,
     is_synthetic=True,
     gold_doc_ids=["DATA_REG", "GUIDELINE_01"],
 )
@@ -163,7 +163,7 @@ V5_SYNTH_03 = V5GroundTruthCase(
     expected_verdict=VerdictType.CONFIRMED,
     expected_relationship=EpistemicRelationship.CONTRADICTS,
     expected_lane=LaneType.LANE_A_GRAPH_LCI,
-    expected_intent=IntentType.COMPARISON,
+    expected_strategy=SearchStrategyType.COMPARISON,
     is_synthetic=True,
     gold_doc_ids=["GDPR_EXTRACT", "DPA_01"],
 )
@@ -250,16 +250,16 @@ def evaluate_v5_ground_truth(
     details["found_lane"] = finding.lane_used
     details["expected_lane"] = case.expected_lane.value
 
-    # 4. Intent match
-    intent_match = finding.intent_classified == case.expected_intent.value
-    details["found_intent"] = finding.intent_classified
-    details["expected_intent"] = case.expected_intent.value
+    # 4. Strategy match
+    strategy_match = finding.search_strategy == case.expected_strategy.value
+    details["found_strategy"] = finding.search_strategy
+    details["expected_strategy"] = case.expected_strategy.value
 
     return V5GroundTruthResult(
         case_id=case.case_id,
         verdict_match=verdict_match,
         relationship_match=relationship_match,
         lane_match=lane_match,
-        intent_match=intent_match,
+        strategy_match=strategy_match,
         details=details,
     )

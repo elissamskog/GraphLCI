@@ -83,7 +83,19 @@ def determine_verdict_type(
     if contradicting > supporting and strong_contradict < 2:
         return VerdictType.PARTIALLY_REFUTED
     if supporting > contradicting and strong_support >= 2:
-        return VerdictType.CONFIRMED
+        # Strict Rule: CONFIRMED requires at least one exact quote (C)
+        # linked to a structural relationship (A).
+        has_linked_structural = any(
+            r.relationship in _STRONG_SUPPORT and
+            r.evidence_quote and
+            any(e.exact_quote == r.evidence_quote and e.source_chunk for e in evidence)
+            for r in relationships
+        )
+        if has_linked_structural:
+            return VerdictType.CONFIRMED
+        else:
+            return VerdictType.PARTIALLY_CONFIRMED
+
     if supporting > contradicting and strong_support < 2:
         return VerdictType.PARTIALLY_CONFIRMED
 

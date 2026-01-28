@@ -8,9 +8,12 @@ Generates natural-language summaries for detected communities.
 
 from __future__ import annotations
 
+import re
 import json
 import logging
+import ast
 from typing import Dict
+
 
 from schemas.contracts import (
     CommunityStructure,
@@ -20,16 +23,45 @@ from schemas.contracts import (
 
 logger = logging.getLogger(__name__)
 
-
 def _parse_llm_response(text: str) -> dict:
-    """Parse an LLM JSON response, stripping markdown fences if present."""
+    """Hardened parser to handle physical newlines inside LLM-generated JSON strings."""
     text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-    return json.loads(text)
+    
+    # 1. Extract the JSON block
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in response.")
+    
+    raw_content = match.group()
+
+    # 2. Sanitize physical newlines inside strings
+    # This regex looks for newlines that are NOT followed by a JSON key pattern or closing brace
+    # and replaces them with a space to keep the string 'terminated'.
+    lines = raw_content.splitlines()
+    sanitized_lines = []
+    for i, line in enumerate(lines):
+        trimmed = line.strip()
+        # If the line doesn't end with a structural JSON character, 
+        # it is likely a mid-paragraph break.
+        if i < len(lines) - 1 and not any(trimmed.endswith(c) for c in [',', '{', '}', '[', ']']):
+            sanitized_lines.append(trimmed + " ")
+        else:
+            sanitized_lines.append(line)
+    
+    clean_text = "\n".join(sanitized_lines)
+
+    # 3. Primary: Standard JSON
+    try:
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Fallback: Python Literal (Handles single quotes)
+    try:
+        return ast.literal_eval(clean_text)
+    except Exception as e:
+        logger.error("Total parse failure. Raw: %s", text)
+        raise ValueError(f"Could not parse LLM output: {e}")
 
 
 def summarize_communities(

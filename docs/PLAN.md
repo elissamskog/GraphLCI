@@ -1,5 +1,4 @@
-```markdown
-# KnowledgeAudit: Technical Plan
+# Technical Plan
 
 > **Statistical Stack & Algorithms:** Cosine similarity over dense embeddings |
 > HNSW approximate nearest-neighbor index | Personalized PageRank (PPR) with
@@ -789,14 +788,3 @@ Demonstrates a CONTRADICTION query ("Does the MSA liability cap contradict DORA?
 | Relationship Detection F1 | ≥ 0.65 |
 | End-to-End Accuracy | ≥ 0.75 |
 | Graph Contribution Δ | ≥ 0.10 |
-
-**Graph Contribution Δ** = (Full System Accuracy) - (LCI-Only Accuracy)
-
-This is the core hypothesis test: does the graph help?
-
----
-
-*Document Version: 5.0*
-*Architecture: HippoRAG + GraphRAG Hybrid*
-*Last Updated: January 2026*
-```

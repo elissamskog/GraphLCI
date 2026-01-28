@@ -13,7 +13,10 @@ import os
 import hashlib
 import struct
 import requests
+import logging
 from typing import List, Protocol, runtime_checkable
+
+logger = logging.getLogger("knowledgeaudit.llm_client")
 
 
 @runtime_checkable
@@ -28,20 +31,64 @@ class OllamaClient:
         self.last_usage = None
 
     def generate(self, prompt: str) -> str:
-        response = requests.post(
-            f"{self.base_url}/api/generate",
-            json={"model": self.model, "prompt": prompt, "stream": False},
-            timeout=300,
-        )
-        response.raise_for_status()
-        data = response.json()
-        self.last_usage = {
-            "prompt_tokens": data.get("prompt_eval_count", 0),
-            "completion_tokens": data.get("eval_count", 0),
-            "total_tokens": data.get("prompt_eval_count", 0)
-                         + data.get("eval_count", 0),
-        }
-        return data["response"]
+            endpoint = f"{self.base_url}/api/chat"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "format": "json",
+                "keep_alive": -1,
+                "options": {
+                    "num_ctx": 32768,  
+                    "temperature": 0.0,
+                    "num_gpu": 99,     
+                }
+            }
+            
+            try:
+                response = requests.post(
+                    endpoint,
+                    json=payload,
+                    timeout=300,
+                )
+                
+                # RAW LOGGING: Capture exactly what Ollama returned
+                logger.debug("--- RAW LLM RESPONSE START ---")
+                logger.debug("Status: %s", response.status_code)
+                logger.debug("Body: %s", response.text)
+                logger.debug("--- RAW LLM RESPONSE END ---")
+
+                if response.status_code == 404:
+                    logger.critical("Ollama endpoint NOT FOUND at %s.", endpoint)
+                response.raise_for_status()
+                
+            except requests.exceptions.RequestException as e:
+                logger.critical("LLM Client Request Failed: %s", str(e))
+                # If a 500 error occurs, log the partial response text if available
+                if hasattr(e, 'response') and e.response is not None:
+                    logger.error("Error Response Body: %s", e.response.text)
+                raise
+
+            data = response.json()
+            
+            # Monitor for silent truncation
+            prompt_eval = data.get("prompt_eval_count", 0)
+            if prompt_eval >= payload["options"]["num_ctx"]:
+                logger.warning(
+                    "CONTEXT OVERFLOW: prompt_eval_count (%d) >= num_ctx (%d). "
+                    "The model's reasoning is likely truncated.",
+                    prompt_eval, payload["options"]["num_ctx"]
+                )
+
+            message = data.get("message", {})
+            content = message.get("content", "")
+            
+            self.last_usage = {
+                "prompt_tokens": prompt_eval,
+                "completion_tokens": data.get("eval_count", 0),
+                "total_tokens": prompt_eval + data.get("eval_count", 0),
+            }
+            return content
 
 
 class MockLLMClient:

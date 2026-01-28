@@ -379,40 +379,33 @@ class V5IntrinsicValidator:
 
     @staticmethod
     def _check_lane_consistency(rd) -> float:
-        """Check that intent classification maps to the correct lane.
+        """Check that strategy classification maps to the correct lane.
 
-        Routing rules:
-        - COMPARISON, CONTRADICTION_DETECTION, CLAIM_VERIFICATION → LANE_A
-        - SENSEMAKING, EVIDENCE_SYNTHESIS → LANE_B
-        - LOOKUP → LANE_C
+        - COMPARISON, CONTRADICTION_DETECTION, CLAIM_VERIFICATION -> LANE_A
+        - LOOKUP -> LANE_C
         """
-        from schemas.contracts import IntentType, LaneType
+        from schemas.contracts import SearchStrategyType, LaneType
 
-        intent = rd.intent.classification
+        strategy = rd.search_strategy.classification
         lane = rd.selected_lane
 
-        lane_a_intents = {
-            IntentType.COMPARISON,
-            IntentType.CONTRADICTION_DETECTION,
-            IntentType.CLAIM_VERIFICATION,
-            IntentType.METHODOLOGY_COMPARISON,
+        lane_a_strategies = {
+            SearchStrategyType.COMPARISON,
+            SearchStrategyType.CONTRADICTION_DETECTION,
+            SearchStrategyType.CLAIM_VERIFICATION,
         }
-        lane_b_intents = {
-            IntentType.SENSEMAKING,
-            IntentType.EVIDENCE_SYNTHESIS,
-        }
-        lane_c_intents = {
-            IntentType.LOOKUP,
+        
+        lane_c_strategies = {
+            SearchStrategyType.LOOKUP,
         }
 
-        if intent in lane_a_intents and lane == LaneType.LANE_A_GRAPH_LCI:
+        if strategy in lane_a_strategies and lane == LaneType.LANE_A_GRAPH_LCI:
             return 1.0
-        if intent in lane_b_intents and lane == LaneType.LANE_B_GRAPH_ONLY:
-            return 1.0
-        if intent in lane_c_intents and lane == LaneType.LANE_C_VECTOR_ONLY:
+        
+        if strategy in lane_c_strategies and lane == LaneType.LANE_C_VECTOR_ONLY:
             return 1.0
 
-        # Not a strict failure for intents that could reasonably go either way
+        # Not a strict failure for strategies that could reasonably go either way
         return 0.0
 
     # ------------------------------------------------------------------

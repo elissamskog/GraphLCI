@@ -11,7 +11,7 @@ This document describes the v5 evaluation framework for KnowledgeAudit. The fram
 - **Corpus:** ~5,000 PubMed abstracts (indexed once into a single knowledge graph)
 - **Claims:** Validation-split claims, each labeled with a verdict and zero or more evidence documents (identified by doc ID + sentence indices)
 
-Entry point: `python -m evaluation.run_scifact_v5`
+Entry point: `python -m evaluation.run_evaluation_v5 --dataset scifact`
 
 ### WikiFactClaims
 
@@ -23,7 +23,7 @@ WikiFactClaims is a multi-hop reasoning benchmark derived from HotpotQA. Each ro
 
 The key structural difference from SciFact: context passages are inline per-row, so the knowledge graph is built per-row rather than against a global corpus.
 
-Entry point: `python -m evaluation.run_wikifactclaims_v5`
+Entry point: `python -m evaluation.run_evaluation_v5 --dataset wikifactclaims`
 
 ### Shared Labels
 
@@ -229,32 +229,23 @@ After indexing, diagnostics are collected from each pipeline stage and logged to
 
 **Librarian:** graph nodes/edges, document count, bridge edges (cross-document), community count, edge/node type distributions, document coverage (with/without nodes), coreference analysis (multi-doc groups, variant counts), cross-document entity overlap.
 
-## CLI Reference
-
-### SciFact
+### Unified Runner
 
 ```
-python -m evaluation.run_scifact_v5 [options]
+python -m evaluation.run_evaluation_v5 [options]
 
---limit N           Evaluate first N claims (default: all)
---output PATH       Output markdown path (default: output.md)
---model NAME        Ollama LLM model (default: OLLAMA_MODEL env or qwen2.5:14b)
---embed-model NAME  Ollama embedding model (default: OLLAMA_EMBED_MODEL env or nomic-embed-text)
---mock              Use mock clients for smoke testing
---trace-chunks N    Chunk details in trace JSON: 0=skip, -1=all (default: 50)
---small-corpus      Index only limit*5 docs instead of full corpus
---trace-level LEVEL minimal | standard | full (default: standard)
-```
+--dataset {scifact,wikifactclaims} (required)
+--limit N              Maximum items to evaluate (default: all)
+--output PATH          Output markdown path (default: {dataset}_output.md)
+--model NAME           Ollama LLM model (default: OLLAMA_MODEL env)
+--embed-model NAME     Ollama embedding model (default: OLLAMA_EMBED_MODEL env)
+--mock                 Use mock clients for smoke testing
+--trace-level LEVEL    minimal | standard | full (default: standard)
 
-### WikiFactClaims
+# SciFact only
+--small-corpus         Index only limit*5 docs instead of full corpus
+--trace-chunks N       Chunk details in trace JSON: 0=skip, -1=all (default: 50)
 
-```
-python -m evaluation.run_wikifactclaims_v5 [options]
-
---limit N           Maximum number of rows to evaluate (default: all)
---output PATH       Output markdown file path (default: wiki_output.md)
---model NAME        Ollama LLM model (default: OLLAMA_MODEL env or qwen2.5:14b)
---embed-model NAME  Ollama embedding model (default: OLLAMA_EMBED_MODEL env)
---mock              Use mock clients for smoke testing
---data-path PATH    Path to wikifactclaims.jsonl (default: data/raw/wikifactclaims/wikifactclaims.jsonl)
+# WikiFactClaims only
+--data-path PATH       Path to wikifactclaims.jsonl
 ```

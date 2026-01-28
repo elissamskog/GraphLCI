@@ -7,10 +7,10 @@ Receives PlannerRequest from ROOT, returns PlannerResponse.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
 import sys
 import os
+import logging
+from typing import Any, Dict, List, Optional
 # Add project root so 'schemas' can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # Add this file's directory so 'planner' resolves to the inner package (must be first)
@@ -19,10 +19,10 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from schemas.contracts import (
     DomainType,
     FocusedContext,
-    GlobalContext,
+    GlobalContext,  # Deprecated
     IdentifiedTargets,
-    IntentClassification,
-    IntentType,
+    SearchStrategyClassification,
+    SearchStrategyType,
     LaneType,
     PlannerInput,
     PlannerOutput,
@@ -38,7 +38,7 @@ from schemas.contracts import (
     TextChunk,
 )
 
-from planner.intent_classifier import ClassificationInput, IntentClassifier
+from planner.search_strategy_classifier import ClassificationInput, SearchStrategyClassifier
 from planner.target_extractor import ExtractionInput, TargetExtractor
 from planner.lane_router import LaneRouter, RoutingInput
 from planner.query_embedder import embed_query
@@ -46,9 +46,10 @@ from planner.seed_finder import find_seed_nodes
 from planner.ppr_expander import personalized_pagerank, extract_scope
 from planner.context_assembler import (
     assemble_focused_context,
-    assemble_global_context,
     assemble_targeted_context,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -65,7 +66,7 @@ class PlannerController:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        self.intent_classifier = IntentClassifier(self.config)
+        self.classifier = SearchStrategyClassifier(self.config)
         self.target_extractor = TargetExtractor(self.config)
         self.lane_router = LaneRouter(self.config)
 
@@ -80,8 +81,8 @@ class PlannerController:
         4. Compose RouterDecision and wrap in PlannerResponse
         """
         try:
-            # Step 1: Classify intent
-            classification = self.intent_classifier.classify(
+            # Step 1: Classify search strategy
+            classification = self.classifier.classify(
                 ClassificationInput(
                     query_text=request.query_request.query_text,
                     user_context=request.query_request.user_context,
@@ -100,7 +101,7 @@ class PlannerController:
             # Step 3: Route to lane
             routing = self.lane_router.route(
                 RoutingInput(
-                    intent=classification.intent,
+                    strategy=classification.strategy,
                     targets=targets.identified_targets,
                     corpus_metadata=self._get_corpus_metadata(),
                 )
@@ -109,7 +110,7 @@ class PlannerController:
             # Step 4: Compose decision
             router_decision = RouterDecision(
                 query_id=request.query_request.query_id,
-                intent=classification.intent,
+                search_strategy=classification.strategy,
                 selected_lane=routing.selected_lane,
                 requires_graph_scope=routing.requires_graph_scope,
                 identified_targets=targets.identified_targets,
@@ -153,13 +154,13 @@ class PlannerControllerV5:
     """
     V5 controller for the PLANNER instance.
 
-    Pipeline: embed query -> find seeds -> PPR expand -> classify intent
+    Pipeline: embed query -> find seeds -> PPR expand -> classify strategy
     -> route lane -> assemble context -> return PlannerOutput.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        self.intent_classifier = IntentClassifier(self.config)
+        self.classifier = SearchStrategyClassifier(self.config)
 
     def process(self, planner_input: PlannerInput) -> PlannerOutput:
         """Run the full v5 planner pipeline."""
@@ -196,53 +197,69 @@ class PlannerControllerV5:
             min_score=self.config.get('scope_min_score', 0.01),
         )
 
-        # Step 4: Classify intent (reuse v4 offline classifier)
-        classification = self.intent_classifier.classify(
+        # Step 4: Classify strategy (reuse v4 offline classifier)
+        classification = self.classifier.classify(
             ClassificationInput(query_text=query_text)
         )
 
         # Step 5: Route lane (v5 rules)
-        lane = self._route_v5(classification.intent, scope)
+        lane = self._route_v5(classification.strategy, scope)
 
         # Step 6: Build router decision
         router_decision = RouterDecisionV5(
             query_id=query_id,
-            intent=classification.intent,
+            search_strategy=classification.strategy,
             selected_lane=lane,
             seed_nodes=seeds,
             scope=scope,
-            confidence=classification.intent.confidence,
+            confidence=classification.strategy.confidence,
         )
 
-        # Step 7: Assemble context per lane
+        # Step 7: Assemble context (Aggregator Pattern)
+        # Always gather targeted context (Lane C) because it's cheap (vector lookup).
+        # Gather focused context (Lane A) if we have a valid scope.
+        
         focused: Optional[FocusedContext] = None
         global_ctx: Optional[GlobalContext] = None
         targeted: Optional[TargetedContext] = None
 
-        if lane == LaneType.LANE_A_GRAPH_LCI:
+        # --- Lane A: Graph Context ---
+        if planner_input.graph and scope and len(scope.nodes) > 0:
             focused = assemble_focused_context(
                 scope,
                 planner_input.graph,
                 planner_input.document_store or {},
             )
-        elif lane == LaneType.LANE_B_GRAPH_ONLY:
-            if planner_input.community_structure is not None:
-                summaries = {
-                    cid: c.summary or ""
-                    for cid, c in planner_input.community_structure.communities.items()
-                }
-                global_ctx = assemble_global_context(
-                    scope,
-                    planner_input.community_structure,
-                    summaries,
-                )
-        elif lane == LaneType.LANE_C_VECTOR_ONLY:
-            chunks = self._gather_chunks(planner_input)
-            targeted = assemble_targeted_context(
-                scope,
-                chunks,
-                query_embedding,
-            )
+
+        # --- Lane C: Vector Context ---
+        chunks = self._gather_chunks(planner_input)
+        targeted = assemble_targeted_context(
+            scope,
+            chunks,
+            query_embedding,
+        )
+
+        # --- De-duplication: Prioritize Graph Context ---
+        if focused and targeted and targeted.chunks:
+            # De-duplication: Prioritize Graph Context
+            # Gather chunk IDs already covered by graph nodes in focused context
+            covered_chunk_ids = set()
+            if planner_input.graph and getattr(planner_input.graph, "nodes", None):
+                # v5 KnowledgeGraph has 'nodes' dict
+                for node_id in scope.nodes:
+                    # Look up full node in graph to get source_chunks
+                    graph_node = planner_input.graph.nodes.get(node_id)
+                    if graph_node and hasattr(graph_node, "source_chunks"):
+                        for cid in graph_node.source_chunks:
+                            covered_chunk_ids.add(cid)
+            
+            # Filter targeted context chunks
+            if covered_chunk_ids:
+                unique_chunks = [
+                    c for c in targeted.chunks 
+                    if c.chunk.chunk_id not in covered_chunk_ids
+                ]
+                targeted.chunks = unique_chunks
 
         return PlannerOutput(
             router_decision=router_decision,
@@ -252,38 +269,32 @@ class PlannerControllerV5:
         )
 
     def _route_v5(
-        self, intent: IntentClassification, scope: Scope,
+        self, strategy: SearchStrategyClassification, scope: Scope,
     ) -> LaneType:
         """V5 routing rules.
 
         - COMPARISON -> LANE_A
-        - SENSEMAKING -> LANE_B (override to LANE_A if document_count <= 5)
         - LOOKUP -> LANE_C
         - Override: if scope has < 5 nodes -> LANE_C
         - Low confidence fallback -> LANE_C
         """
         confidence_threshold = self.config.get('confidence_threshold', 0.7)
-        if intent.confidence < confidence_threshold:
+        if strategy.confidence < confidence_threshold:
             return LaneType.LANE_C_VECTOR_ONLY
 
         node_count = len(scope.nodes)
         if node_count < 5:
             return LaneType.LANE_C_VECTOR_ONLY
 
-        intent_type = intent.classification
+        strategy_type = strategy.classification
 
-        if intent_type == IntentType.COMPARISON:
+        if strategy_type == SearchStrategyType.COMPARISON:
             return LaneType.LANE_A_GRAPH_LCI
 
-        if intent_type == IntentType.SENSEMAKING:
-            doc_count = len(scope.document_ids)
-            if doc_count <= 5:
-                return LaneType.LANE_A_GRAPH_LCI
-            return LaneType.LANE_B_GRAPH_ONLY
-
-        if intent_type == IntentType.LOOKUP:
+        if strategy_type == SearchStrategyType.LOOKUP:
             return LaneType.LANE_C_VECTOR_ONLY
-
+            
+        # Fallback for others (CLAIM_VERIFICATION, CONTRADICTION_DETECTION)
         return LaneType.LANE_C_VECTOR_ONLY
 
     def _gather_chunks(self, planner_input: PlannerInput) -> List[TextChunk]:
@@ -339,14 +350,8 @@ def test_planner_controller() -> None:
             "expected_graph_scope": True,
         },
         # 2. SENSEMAKING with graph -> LANE_B, graph_scope=True
-        {
-            "name": "SENSEMAKING with graph -> LANE_B",
-            "config": config_with_graph,
-            "query": "What are the key risk themes across all documents?",
-            "query_id": "q2",
-            "expected_lane": LaneType.LANE_B_GRAPH_ONLY,
-            "expected_graph_scope": True,
-        },
+        # SENSEMAKING test case removed
+
         # 3. LOOKUP -> LANE_C, graph_scope=False
         {
             "name": "LOOKUP -> LANE_C",
@@ -386,10 +391,10 @@ def test_planner_controller() -> None:
         {
             "name": "All RouterDecision fields populated",
             "config": config_with_graph,
-            "query": "Summarize the liability provisions across all contracts",
+            "query": "Does the MSA contradict DORA?",
             "query_id": "q7",
             "validate_fields": True,
-            "expected_lane": LaneType.LANE_B_GRAPH_ONLY,
+            "expected_lane": LaneType.LANE_A_GRAPH_LCI,
             "expected_graph_scope": True,
         },
     ]
@@ -459,18 +464,18 @@ def test_planner_controller() -> None:
                 if rd.query_id != case["query_id"]:
                     all_ok = False
                     issues.append(f"query_id mismatch: {rd.query_id}")
-                if rd.intent is None:
+                if rd.search_strategy is None:
                     all_ok = False
-                    issues.append("intent is None")
+                    issues.append("search_strategy is None")
                 if rd.identified_targets is None:
                     all_ok = False
                     issues.append("identified_targets is None")
                 if rd.domain_expectation is None:
                     all_ok = False
                     issues.append("domain_expectation is None")
-                if rd.intent and not isinstance(rd.intent.classification, IntentType):
+                if rd.search_strategy and not isinstance(rd.search_strategy.classification, SearchStrategyType):
                     all_ok = False
-                    issues.append("intent.classification not IntentType")
+                    issues.append("search_strategy.classification not SearchStrategyType")
                 if rd.domain_expectation and not isinstance(rd.domain_expectation, DomainType):
                     all_ok = False
                     issues.append("domain_expectation not DomainType")
@@ -486,8 +491,8 @@ def test_planner_controller() -> None:
             rd = response.router_decision
             print(f"  Lane:        {rd.selected_lane.value}")
             print(f"  Graph scope: {rd.requires_graph_scope}")
-            print(f"  Intent:      {rd.intent.classification.value} "
-                  f"(conf={rd.intent.confidence})")
+            print(f"  Strategy:    {rd.search_strategy.classification.value} "
+                  f"(conf={rd.search_strategy.confidence})")
             print(f"  Targets:     docs={rd.identified_targets.explicit_docs}, "
                   f"entities={rd.identified_targets.implicit_entities}")
             print(f"  Domain:      {rd.domain_expectation.value}")

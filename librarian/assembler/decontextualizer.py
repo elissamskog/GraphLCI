@@ -59,7 +59,7 @@ class LLMClient(Protocol):
 # ============================================================================
 
 DECONTEXTUALIZATION_PROMPT = """\
-You are a legal text processor performing definition substitution.
+You are an expert text processor performing definition substitution for an audit.
 
 ORIGINAL TEXT:
 {content}
@@ -67,25 +67,25 @@ ORIGINAL TEXT:
 DEFINITIONS AVAILABLE:
 {definitions}
 
-TASK: Rewrite the text by substituting defined terms with their definitions.
+TASK: Rewrite the text by substituting defined terms with their definitions to make the text self-contained.
 
 RULES:
 1. Replace each defined term with: [term (defined as: definition)]
 2. Only substitute on first occurrence per paragraph
 3. If substitution would exceed {max_tokens} tokens, note as overflow
 4. If a term references another defined term (circular), note and skip
-5. Preserve legal meaning exactly—do not paraphrase
+5. Preserve original meaning exactly—do not paraphrase
 
 EXAMPLE:
-Original: "Vendor shall indemnify Customer for all Claims."
-Definitions: {{"Vendor": "Acme Corp", "Claims": "any third-party lawsuit or demand"}}
-Output: "Vendor [defined as: Acme Corp] shall indemnify Customer for all Claims [defined as: any third-party lawsuit or demand]."
+Original: "The Publication shall notify the Subscriber of all Changes."
+Definitions: {{"Publication": "The Morning Star", "Changes": "updates to the delivery schedule"}}
+Output: "The Publication [defined as: The Morning Star] shall notify the Subscriber of all Changes [defined as: updates to the delivery schedule]."
 
 Respond in JSON:
 {{
   "decontextualized_content": "...",
   "substitutions_made": [
-    {{"term": "Vendor", "definition": "Acme Corp", "location": "paragraph 1"}}
+    {{"term": "...", "definition": "...", "location": "..."}}
   ],
   "failures": [
     {{"term": "...", "reason": "NOT_FOUND | CIRCULAR | OVERFLOW"}}

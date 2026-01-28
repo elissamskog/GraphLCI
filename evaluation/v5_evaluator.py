@@ -54,7 +54,7 @@ class V5PipelineEvaluator:
             feedback.append(Feedback(
                 severity="HIGH",
                 module="EXPLORER",
-                file="explorer/explorer_controller.py",
+                file="orchestrator.py",
                 issue="Explorer produced zero nodes",
                 detail=(
                     "NodeSet.nodes is empty. The explorer should produce "
@@ -71,7 +71,7 @@ class V5PipelineEvaluator:
             feedback.append(Feedback(
                 severity="HIGH",
                 module="EXPLORER",
-                file="explorer/explorer_controller.py",
+                file="orchestrator.py",
                 issue="Explorer extracted zero entities",
                 detail=(
                     f"NodeSet.entity_count is 0 with {ns.chunk_count} chunks. "
@@ -88,7 +88,7 @@ class V5PipelineEvaluator:
             feedback.append(Feedback(
                 severity="MEDIUM",
                 module="EXPLORER",
-                file="explorer/explorer_controller.py",
+                file="orchestrator.py",
                 issue="Explorer extracted zero claims",
                 detail=(
                     f"NodeSet.claim_count is 0 with {ns.chunk_count} chunks. "
@@ -108,7 +108,7 @@ class V5PipelineEvaluator:
             feedback.append(Feedback(
                 severity="HIGH",
                 module="EXPLORER",
-                file="explorer/explorer_controller.py",
+                file="orchestrator.py",
                 issue=f"{len(nodes_without_embedding)} node(s) have no embedding",
                 detail=(
                     f"Found {len(nodes_without_embedding)} EmbeddedNode(s) with "
@@ -126,7 +126,7 @@ class V5PipelineEvaluator:
             feedback.append(Feedback(
                 severity="HIGH",
                 module="EXPLORER",
-                file="explorer/explorer_controller.py",
+                file="orchestrator.py",
                 issue="NodeSet has no source_doc_ids",
                 detail=(
                     "NodeSet.source_doc_ids is empty. This should list all "

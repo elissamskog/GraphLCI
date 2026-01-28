@@ -73,30 +73,30 @@ class LLMClient(Protocol):
 # ============================================================================
 
 EDGE_INTERPRETATION_PROMPT = """\
-You are a scope resolver determining which documents are needed to answer a query.
+You are a scope resolver determining which documents are required to verify a specific claim.
 
-QUERY: {query_text}
-INTENT: {intent_classification}
+CLAIM UNDER AUDIT: {query_text}
+SEARCH STRATEGY: {intent_classification}
 PRIMARY TARGETS: {explicit_docs}
 
 GRAPH TRAVERSAL RESULTS:
-The following edges connect the target documents:
+The following structural edges connect the target documents:
 
 {edges_found}
 
-TASK: Determine which documents and edges are relevant to this specific query.
+TASK: Identify which documents and edges are essential for a grounded audit of this claim.
 
 For each edge, assess:
-1. Is this edge relevant to answering the query?
-2. What reasoning hint should be passed to the LCI model?
-3. What precedence rule applies (if any)?
+1. Is this edge relevant to the logical or temporal verification of the claim?
+2. What reasoning hint should be passed to the synthesis model?
+3. What precedence rule applies to resolve conflicting information?
 
 EDGE TYPE SEMANTICS:
-- AMENDS: Later document's clause wins unless explicitly stated otherwise
-- GOVERNS: Regulatory floor applies—contract can only be stricter
-- DEFINES_TERM: Definition must be injected before usage
-- INCORPORATES: Referenced document is part of the primary document
-- TEMPORAL_SEQUENCE: Check for implicit supersession
+- AMENDS: The information in the source document updates or corrects the target.
+- GOVERNS: The source document defines the requirements or rules for the target.
+- DEFINES_TERM: The source defines concepts or terminology used in the target.
+- INCORPORATES: The target is considered a structural part of the source.
+- TEMPORAL_SEQUENCE: Establishes a chronological order between facts or events.
 
 Respond in JSON:
 {{
@@ -104,21 +104,21 @@ Respond in JSON:
     {{
       "edge_id": "...",
       "relevance_score": 0.0-1.0,
-      "reasoning_hint": "Natural language hint for LCI",
-      "precedence_rule": "If conflict, Doc B supersedes Doc A" | null
+      "reasoning_hint": "Chronological precedence: Doc B provides the updated founding date for Entity X.",
+      "precedence_rule": "If conflict, Doc B updates Doc A" | null
     }}
   ],
   "supporting_documents": [
     {{
       "doc_id": "...",
       "dependency_type": "DEFINITION | AMENDMENT | REGULATION | REFERENCE",
-      "required_sections": ["Section 1.1", "Exhibit A"] | null
+      "required_sections": ["Section 1.1", "Table 4"] | null
     }}
   ],
   "domain_pair": {{
     "primary_domain": "...",
     "secondary_domain": "..." | null,
-    "cross_domain_logic": "Regulatory floor supersedes contract" | null
+    "cross_domain_logic": "Higher-order documentation defines the baseline for synthesis" | null
   }},
   "completeness_confidence": 0.0-1.0,
   "warnings": ["..."]
@@ -376,7 +376,7 @@ class ScopeResolver:
 
         prompt = EDGE_INTERPRETATION_PROMPT.format(
             query_text=query_text,
-            intent_classification=decision.intent.classification.value,
+            intent_classification=decision.search_strategy.classification.value,
             explicit_docs=", ".join(decision.identified_targets.explicit_docs),
             edges_found=edges_description,
         )
