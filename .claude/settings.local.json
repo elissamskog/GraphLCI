@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(tree:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(ls:*)",
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(xargs:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "Bash(lsof:*)",
+      "WebSearch"
+    ]
+  }
+}
