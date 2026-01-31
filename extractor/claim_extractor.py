@@ -29,6 +29,7 @@ def extract_claims(
     chunk: TextChunk,
     entities: List[ExtractedEntity],
     schema: Optional[Dict[str, Any]] = None,
+    num_ctx: Optional[int] = None,
 ) -> List[ExtractedClaim]:
     """Extract claims from a text chunk given known entities.
 
@@ -42,6 +43,8 @@ def extract_claims(
         Entities already extracted from this chunk.
     schema:
         Optional claim-type schema to guide extraction.
+    num_ctx:
+        Optional context window size.
 
     Returns
     -------
@@ -49,8 +52,31 @@ def extract_claims(
         Structured claims with subject, predicate, object, and confidence.
     """
     prompt = _build_prompt(chunk, entities, schema)
-    raw_response = llm_client.generate(prompt)
+    raw_response = llm_client.generate(prompt, num_ctx=num_ctx)
     return _parse_response(raw_response, chunk)
+
+
+def extract_claims_batch(
+    llm_client,
+    chunks: List[TextChunk],
+    entities_list: List[List[ExtractedEntity]],
+    schema: Optional[Dict[str, Any]] = None,
+    num_ctx: Optional[int] = None,
+) -> List[List[ExtractedClaim]]:
+    """Extract claims from multiple chunks in parallel."""
+    if len(chunks) != len(entities_list):
+        raise ValueError("chunks and entities_list must have same length")
+        
+    prompts = []
+    for chunk, entities in zip(chunks, entities_list):
+        prompts.append(_build_prompt(chunk, entities, schema))
+        
+    raw_responses = llm_client.batch_generate(prompts, num_ctx=num_ctx)
+    
+    results = []
+    for raw, chunk in zip(raw_responses, chunks):
+        results.append(_parse_response(raw, chunk))
+    return results
 
 
 def _build_prompt(
@@ -58,60 +84,46 @@ def _build_prompt(
     entities: List[ExtractedEntity],
     schema: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build the OpenIE prompt for claim extraction."""
+    """Build the auditing-focused OpenIE prompt for claim extraction."""
     entity_list = ", ".join(e.surface_form for e in entities) if entities else "(none)"
 
-    schema_guidance = ""
-    if schema:
-        entity_types = schema.get("entity_types", [])
-        if entity_types and isinstance(entity_types, list):
-            type_names = [
-                et.get("name", "")
-                for et in entity_types
-                if isinstance(et, dict) and et.get("name")
-            ]
-            if type_names:
-                schema_guidance = (
-                    f"\nFocus on claims involving these entity types: "
-                    f"{', '.join(type_names)}\n"
-                )
-        else:
-            # Fallback: flat {k: v} format for backward compatibility
-            claim_types = ", ".join(str(v) for v in schema.values())
-            schema_guidance = f"\nFocus on claims of type: {claim_types}\n"
+    # Domain-agnostic guidance covering all claim types
+    audit_focus = (
+        "Focus on extracting:\n"
+        "1. TEMPORAL: Dates, durations, sequences (when something happened)\n"
+        "2. RELATIONAL: Connections between entities (X married Y, X works at Y)\n"
+        "3. ATTRIBUTIVE: Properties and characteristics (X is a Y, X was born in Y)\n"
+        "4. QUANTITATIVE: Numbers, amounts, thresholds\n"
+        "5. CAUSAL: Causes, effects, consequences\n"
+        "6. SHARED CONTEXT: If multiple entities share a location or context (e.g. 'A is in the city where B is'), extract an explicit link between A and B (e.g. 'A is in the same city as B').\n\n"
+        "Extract atomic, verifiable claims focusing on high-fidelity temporal and causal relationships."
+    )
 
-    # ENHANCEMENT (H4): The prompt currently requests generic factual claims.
-    # To produce more specific claims for downstream reasoning, it could
-    # explicitly request temporal, quantitative, and comparative claim types
-    # (e.g., "identify date comparisons, monetary thresholds, and cross-party
-    # obligations").  See docs/investigations/EXTRACTOR_INVESTIGATION.md §H4.
     return (
-        "Extract factual claims from the following text. Each claim should "
-        "be a structured assertion with a subject, predicate, object, and "
-        "description.\n\n"
-        f"Known entities in this text: {entity_list}\n"
-        f"{schema_guidance}\n"
-        "Return a JSON array of objects, each with:\n"
-        '- "claim": the claim text as a complete sentence\n'
-        '- "subject": the subject entity of the claim\n'
-        '- "object": the object entity of the claim\n'
-        '- "predicate": the relationship/action between subject and object\n'
-        '- "description": a brief description of the claim\n'
-        '- "confidence": a float 0.0-1.0 indicating extraction confidence\n\n'
+        "You are an evidence extraction engine. Extract ALL factual claims from the text.\n"
+        "Each claim must be an atomic, standalone assertion that can be verified independently.\n\n"
+        f"KNOWN ENTITIES: {entity_list}\n"
+        f"{audit_focus}\n\n"
+        "Return a JSON array of objects with:\n"
+        '- "claim": The full factual assertion as a standalone sentence.\n'
+        '- "subject": The primary entity.\n'
+        '- "object": The related entity, value, or attribute.\n'
+        '- "predicate": The relationship type (e.g., "founded_in", "employed_at", "is_a", "located_in").\n'
+        '- "confidence": Float 0.0-1.0.\n\n'
         "EXAMPLE:\n"
-        'Text: "The Vendor\'s liability shall not exceed $1,000,000."\n'
-        "Entities: Vendor, $1,000,000\n"
+        'Text: "Acme Corp was founded in 1985 by Jane Doe, who later became its CEO."\n'
         "Output:\n"
-        '[{"claim": "Vendor liability is capped at $1,000,000", '
-        '"subject": "Vendor", "object": "$1,000,000", '
-        '"predicate": "liability_capped_at", '
-        '"description": "Contractual liability limitation", '
-        '"confidence": 0.95}]\n\n'
-        "Return ONLY the JSON array.\n\n"
+        "[\n"
+        '  {"claim": "Acme Corp was founded in 1985", "subject": "Acme Corp", "object": "1985", "predicate": "founded_in", "confidence": 0.99},\n'
+        '  {"claim": "Jane Doe founded Acme Corp", "subject": "Jane Doe", "object": "Acme Corp", "predicate": "founded", "confidence": 0.99},\n'
+        '  {"claim": "Jane Doe became CEO of Acme Corp", "subject": "Jane Doe", "object": "Acme Corp", "predicate": "became_ceo_of", "confidence": 0.98}\n'
+        "]\n\n"
+        "Return ONLY the JSON array with ALL claims found in the text.\n\n"
         f"--- TEXT (chunk {chunk.chunk_id}) ---\n"
         f"{chunk.text}\n"
         "--- END TEXT ---"
     )
+
 
 
 def _parse_response(raw: str, chunk: TextChunk) -> List[ExtractedClaim]:

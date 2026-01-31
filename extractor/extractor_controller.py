@@ -14,6 +14,7 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from schemas.contracts import (
@@ -28,11 +29,12 @@ from schemas.contracts import (
     NodeSet,
     TextChunk,
 )
-from extractor.entity_extractor import extract_entities
-from extractor.claim_extractor import extract_claims
+from extractor.entity_extractor import extract_entities, extract_entities_batch, refine_entities_batch
+from extractor.claim_extractor import extract_claims, extract_claims_batch
 from extractor.gleaner import glean_missing
 from extractor.coreference_resolver import resolve_coreferences
 from extractor.node_embedder import embed_nodes, NodeDescriptor
+from extractor.structural_analyzer import StructuralAnalyzer
 
 logger = logging.getLogger("knowledgeaudit.extractor")
 
@@ -64,9 +66,42 @@ class ExtractorController:
         self._embed_client = embedding_client
         self._config = config or {}
 
+        # Initialize structural analyzer for deterministic pre-processing
+        structural_cfg = self._config.get("structural_analysis", {})
+        use_spacy = structural_cfg.get("use_spacy", True)
+        spacy_model = structural_cfg.get("spacy_model", "en_core_web_sm")
+        self._structural_analyzer = StructuralAnalyzer(
+            use_spacy=use_spacy,
+            spacy_model=spacy_model,
+        )
+
     # ------------------------------------------------------------------
     # Config helpers
     # ------------------------------------------------------------------
+
+    def _inject_structural_bridges(
+        self,
+        chunk: TextChunk,
+        entities: List[ExtractedEntity],
+    ) -> List[ExtractedClaim]:
+        """Extract structural bridge claims using deterministic analysis.
+
+        Delegates to StructuralAnalyzer for dependency-based or heuristic-based
+        structural relationship detection.
+
+        Parameters
+        ----------
+        chunk:
+            The text chunk being analyzed.
+        entities:
+            Entities extracted from this chunk.
+
+        Returns
+        -------
+        List[ExtractedClaim]
+            Structural bridge claims with high confidence.
+        """
+        return self._structural_analyzer.extract_structural_bridges(chunk, entities)
 
     def _load_schema(self) -> Optional[Dict[str, Any]]:
         """Load schema from config (inline or file path)."""
@@ -140,7 +175,6 @@ class ExtractorController:
             tracing_cfg = self._config.get("tracing", {})
             tracing_enabled = tracing_cfg.get("enabled", True)
             tracing_verbosity = tracing_cfg.get("verbosity", "full")
-
             # Step 1: Per-chunk extraction
             all_entities: List[ExtractedEntity] = []
             all_claims: List[ExtractedClaim] = []
@@ -148,57 +182,115 @@ class ExtractorController:
             chunk_claims_map: Dict[str, List[ExtractedClaim]] = {}
             chunk_details: List[ChunkExtractionDetail] = []
 
-            for chunk in all_chunks:
-                # Extract entities (skip if NER disabled)
-                if phases_ner:
-                    entities = extract_entities(self._llm, chunk, schema=schema)
-                    llm_calls += 1
-                else:
-                    entities = []
+            # Batch execution
+            extraction_cfg = self._config.get("extraction", {})
+            num_ctx = extraction_cfg.get("num_ctx", 4096)
+            batch_size = 2 if getattr(self._llm, "model_path", "").startswith("mlx") else 1
 
-                # Extract claims (skip if OpenIE disabled)
-                if phases_openie:
-                    claims = extract_claims(self._llm, chunk, entities, schema=schema)
-                    llm_calls += 1
-                else:
-                    claims = []
+            for i in range(0, len(all_chunks), batch_size):
+                batch_chunks = all_chunks[i : i + batch_size]
+                logger.info("DEBUG: Processing batch of %d chunks (start_idx=%d)", len(batch_chunks), i)
+                
+                try:
+                    # 1. Batch Entities
+                    batch_entities = []
+                    if phases_ner:
+                        batch_entities = extract_entities_batch(self._llm, batch_chunks, schema=schema, num_ctx=num_ctx)
+                        llm_calls += 1 # 1 batch call
+                    else:
+                        batch_entities = [[] for _ in batch_chunks]
 
-                # Glean missing (skip if gleaning disabled)
-                if gleaning_enabled:
-                    gleaning = glean_missing(
-                        self._llm, chunk, entities, claims,
-                        max_iter=gleaning_max_iter,
-                        skip_below_tokens=gleaning_skip_tokens,
-                    )
-                    llm_calls += gleaning.iterations_performed
-                    total_gleaning_iterations += gleaning.iterations_performed
-                    entities = entities + gleaning.additional_entities
-                    claims = claims + gleaning.additional_claims
-                    gleaning_iters = gleaning.iterations_performed
-                    gleaning_new_ents = len(gleaning.additional_entities)
-                    gleaning_new_cls = len(gleaning.additional_claims)
-                else:
-                    gleaning_iters = 0
-                    gleaning_new_ents = 0
-                    gleaning_new_cls = 0
+                    # 1b. Batch Refinement (Schema-Guided)
+                    if phases_ner:
+                        refined_batch = refine_entities_batch(self._llm, batch_chunks, batch_entities, num_ctx=num_ctx)
+                        # Merge refined entities
+                        did_refine = False
+                        for k, extra in enumerate(refined_batch):
+                            if extra:
+                                batch_entities[k].extend(extra)
+                                did_refine = True
+                        if did_refine:
+                            llm_calls += 1 # Count the refinement batch call
 
-                all_entities.extend(entities)
-                all_claims.extend(claims)
-                chunk_entities_map[chunk.chunk_id] = entities
-                chunk_claims_map[chunk.chunk_id] = claims
+                    # 2. Batch Claims
+                    batch_claims = []
+                    if phases_openie:
+                        batch_claims = extract_claims_batch(self._llm, batch_chunks, batch_entities, schema=schema, num_ctx=num_ctx)
+                        llm_calls += 1 # 1 batch call
+                    else:
+                        batch_claims = [[] for _ in batch_chunks]
 
-                # Record per-chunk diagnostics
-                chunk_details.append(ChunkExtractionDetail(
-                    chunk_id=chunk.chunk_id,
-                    source_doc_id=chunk.source_doc_id,
-                    token_count=chunk.token_count,
-                    text_preview=chunk.text[:300],
-                    entities=list(entities),
-                    claims=list(claims),
-                    gleaning_iterations=gleaning_iters,
-                    gleaning_new_entities=gleaning_new_ents,
-                    gleaning_new_claims=gleaning_new_cls,
-                ))
+                    # 3. Sequential Gleaning, Structural Analysis & Assembly
+                    for j, chunk in enumerate(batch_chunks):
+                        entities = batch_entities[j]
+                        claims = batch_claims[j]
+
+                        gleaning_iters = 0
+                        gleaning_new_ents = 0
+                        gleaning_new_cls = 0
+
+                        if gleaning_enabled:
+                            gleaning = glean_missing(
+                                self._llm, chunk, entities, claims,
+                                max_iter=gleaning_max_iter,
+                                skip_below_tokens=gleaning_skip_tokens,
+                                num_ctx=num_ctx,
+                            )
+                            # Gleaning is still sequential calls
+                            llm_calls += gleaning.iterations_performed
+                            total_gleaning_iterations += gleaning.iterations_performed
+                            entities = entities + gleaning.additional_entities
+                            claims = claims + gleaning.additional_claims
+                            gleaning_iters = gleaning.iterations_performed
+                            gleaning_new_ents = len(gleaning.additional_entities)
+                            gleaning_new_cls = len(gleaning.additional_claims)
+
+                        # 3a. Structural bridge injection (per-chunk, deterministic)
+                        structural_bridges = self._inject_structural_bridges(chunk, entities)
+                        if structural_bridges:
+                            claims = claims + structural_bridges
+                            logger.debug(
+                                "[%s] Structural bridges: %d",
+                                chunk.chunk_id,
+                                len(structural_bridges),
+                            )
+
+                        detail = ChunkExtractionDetail(
+                            chunk_id=chunk.chunk_id,
+                            source_doc_id=chunk.source_doc_id,
+                            token_count=chunk.token_count,
+                            text_preview=chunk.text[:300],
+                            entities=list(entities),
+                            claims=list(claims),
+                            gleaning_iterations=gleaning_iters,
+                            gleaning_new_entities=gleaning_new_ents,
+                            gleaning_new_claims=gleaning_new_cls,
+                        )
+
+                        all_entities.extend(entities)
+                        all_claims.extend(claims)
+                        chunk_entities_map[chunk.chunk_id] = entities
+                        chunk_claims_map[chunk.chunk_id] = claims
+                        chunk_details.append(detail)
+
+                except Exception as e:
+                    logger.error("Failed to extract batch starting at %d: %s", i, e)
+                    raise
+
+            # --- Debug: Print extracted entities and claims (Summary Only) ---
+            total_structural_bridges = sum(
+                1 for c in all_claims if c.claim_id.endswith(tuple(f"_struct_{i:03d}" for i in range(1000)))
+            )
+            logger.info("=== EXTRACTOR SUMMARY ===")
+            logger.info("  Entities Extracted: %d", len(all_entities))
+            logger.info("  Claims Extracted:   %d", len(all_claims))
+            logger.info("  Structural Bridges: %d", total_structural_bridges)
+            
+            if total_structural_bridges > 0:
+                 # Only show bridge claims as they are critical for debugging graph connectivity
+                for c in all_claims:
+                    if "_struct_" in c.claim_id:
+                        logger.debug("  BRIDGE: %s", c.claim_text)
 
             # Step 2: Coreference resolution
             if coref_enabled:
@@ -268,9 +360,23 @@ class ExtractorController:
                     )
                 )
 
-            # Claim descriptors — one per claim
+            # Claim descriptors — one per unique claim text
+            unique_claims: Dict[str, ExtractedClaim] = {}
+            for claim in all_claims:
+                key = claim.claim_text.strip().lower()
+                if key not in unique_claims:
+                    unique_claims[key] = claim
+                else:
+                    # Merge chunk_id into the existing unique claim if not already there
+                    # Note: NodeDescriptor takes source_chunks as a list.
+                    # We'll handle the source_chunks merging below by referencing all_claims if needed,
+                    # but for now let's just keep the first instance and its chunk.
+                    pass
+            
+            dedup_claims = list(unique_claims.values())
+
             entity_offset = len(coref_groups)
-            for j, claim in enumerate(all_claims):
+            for j, claim in enumerate(dedup_claims):
                 # Find source doc
                 claim_doc_id = ""
                 for ch in all_chunks:

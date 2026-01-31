@@ -312,6 +312,7 @@ class SupportingDocument:
     doc_id: str
     dependency_type: DependencyType
     required_sections: Optional[List[str]]
+    relevance_score: float = 0.0  # v5.2
 
 
 @dataclass
@@ -369,6 +370,7 @@ class OrderedDocument:
     role: str
     content: str
     injection_order: int
+    uid: Optional[str] = None  # Immutable UUID4 for provenance tracking
 
 
 @dataclass
@@ -377,6 +379,22 @@ class LCIPayload:
     preamble: LCIPreamble
     documents: List[OrderedDocument]
     total_tokens: int
+
+
+@dataclass
+class AliasedDocument:  # v5+ Reference Aliasing
+    """A document/chunk with a short alias for LLM prompting."""
+    alias: str            # e.g., "[D1]"
+    uid: str              # Immutable UUID4
+    doc_id: str           # Original doc_id
+    chunk_id: Optional[str] = None  # If from a chunk
+    source_url: Optional[str] = None  # If available
+
+
+@dataclass
+class AliasMap:  # v5+ Reference Aliasing
+    """Mapping from short aliases to full metadata for post-inference join."""
+    mappings: Dict[str, AliasedDocument]  # alias -> metadata
 
 
 @dataclass
@@ -548,6 +566,7 @@ class TextChunk:  # v5
     text: str
     token_count: int
     position: int
+    uid: Optional[str] = None  # Immutable UUID4 for provenance tracking
     page_number: Optional[int] = None
     section_header: Optional[str] = None
 
@@ -822,6 +841,36 @@ class SeedNode:  # v5
 
 
 @dataclass
+class Subclaim:  # v5
+    """An atomic search objective extracted from a complex claim."""
+    subclaim_id: str
+    objective: str  # e.g., "Find Clara Vance's birth location"
+    entities: List[str]  # Entities in this subclaim
+    relationship_type: str  # "attribute", "temporal", "amendment", etc.
+    priority: str  # "primary", "secondary", "bridge"
+
+
+@dataclass
+class ClaimDecomposition:  # v5
+    """Result of decomposing a complex claim into subclaims."""
+    primary_subject: str
+    subclaims: List[Subclaim]
+    bridge_entities: List[str]  # Entities connecting subclaims
+    decomposition_reasoning: str
+    should_decompose: bool  # False for single-hop claims
+    confidence: float
+
+
+@dataclass
+class WeightedSeedSet:  # v5
+    """Seed nodes with assigned weights for weighted PPR."""
+    seeds: List[SeedNode]
+    weights: Dict[str, float]  # node_id -> initial weight
+    primary_node_ids: List[str]
+    bridge_node_ids: List[str]
+
+
+@dataclass
 class ScopedNode:  # v5
     """A node in the PPR-expanded scope."""
     node: EmbeddedNode
@@ -881,6 +930,7 @@ class RouterDecisionV5:  # v5
     seed_nodes: List[SeedNode]
     scope: Optional[Scope] = None
     confidence: float = 0.0
+    claim_decomposition: Optional[ClaimDecomposition] = None
 
 
 @dataclass
@@ -902,6 +952,8 @@ class PlannerOutput:  # v5
     focused_context: Optional[FocusedContext] = None
     global_context: Optional[GlobalContext] = None
     targeted_context: Optional[TargetedContext] = None
+    alias_map: Optional[AliasMap] = None  # For Agnostic Audit provenance
+
 
 
 @dataclass
@@ -930,6 +982,7 @@ class InferredRelationship:  # v5
     relationship: EpistemicRelationship
     confidence: float
     reasoning: str
+    z_score: float = 0.0  # Raw scalar from model (logit or probability)
     evidence_quote: Optional[str] = None
 
 
@@ -951,6 +1004,7 @@ class Verdict:  # v5
     answer: str
     confidence: float
     summary: str
+    z_score: float = 0.0  # Aggregated scalar midpoint
     primary_relationship: Optional[EpistemicRelationship] = None
 
 
@@ -996,6 +1050,8 @@ class ReasonerInput:  # v5
     focused_context: Optional[FocusedContext] = None
     global_context: Optional[GlobalContext] = None
     targeted_context: Optional[TargetedContext] = None
+    alias_map: Optional[AliasMap] = None  # For post-inference metadata join
+
 
 
 @dataclass
@@ -1019,6 +1075,7 @@ class ReasonerTrace:  # v5
     verdict_confidence: float
     llm_time_ms: float
     total_time_ms: float
+    z_score: float = 0.0  # Primary deterministic scalar
     final_prompt: Optional[str] = None
     prompt_token_count: Optional[int] = None
 

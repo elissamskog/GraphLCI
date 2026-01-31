@@ -92,20 +92,20 @@ class DomainReasoner:
         )
 
         return (
-            "You are a legal-domain taxonomy expert. Given the following "
-            "document summaries, identify the distinct domains present and "
-            "any cross-domain relationships.\n\n"
+            "You are an analytical auditing expert. Given the following "
+            "document summaries, identify the distinct subject domains present and "
+            "how they relate to one another.\n\n"
             "Return a JSON object with exactly these keys:\n"
             '- "domains": a list of objects, each with:\n'
-            '    - "domain_id": a short unique identifier (e.g. "dom_corp_law")\n'
+            '    - "domain_id": a short unique identifier (e.g. "dom_media_history")\n'
             '    - "name": human-readable domain name\n'
             '    - "description": 1-2 sentence description\n'
             '    - "indicators": list of terms/phrases that indicate this domain\n'
             '- "cross_domain_relationships": a list of objects, each with:\n'
             '    - "source_domain": domain_id of source\n'
             '    - "target_domain": domain_id of target\n'
-            '    - "relationship_type": one of: regulates, implements, cites, '
-            "references, supersedes, amends\n"
+            '    - "relationship_type": one of: governs, updates, references, '
+            "cites, supports, overlaps\n"
             '    - "reasoning": brief explanation of the relationship\n\n'
             "Return ONLY the JSON object, no additional text.\n\n"
             "--- DOCUMENT SUMMARIES ---\n"

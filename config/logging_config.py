@@ -57,6 +57,10 @@ def setup_logging(
         fh.setFormatter(formatter)
         root.addHandler(fh)
 
+    # Suppress verbose third-party HTTP logs
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def log_file_from_output_path(output_path: str) -> str:
     """Derive a ``.log`` path from an output file path.

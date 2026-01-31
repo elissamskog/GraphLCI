@@ -35,6 +35,8 @@ class PPRInput:
     max_iterations: int = 100
     min_score_threshold: float = 0.01
     max_hops: Optional[int] = None
+    forward_weight_factor: float = 1.0   # v5: weight multiplier for Source -> Target
+    backward_weight_factor: float = 0.5  # v5: weight multiplier for Target -> Source
 
 
 @dataclass
@@ -50,35 +52,30 @@ class PPROutput:
 # ============================================================================
 
 class _AdjacencyGraph:
-    """Lightweight bidirectional adjacency representation.
-
-    Edges in the knowledge graph are directed, but for PPR we treat
-    them as undirected so that information flows both ways (e.g. a
-    DEFINES_TERM edge lets us walk from the usage node back to the
-    definition node).  Each edge contributes a connection weight of 1.0
-    by default, scaled by the edge's confidence.
-    """
-
-    def __init__(self, graph_state: GraphState) -> None:
+    def __init__(self, graph_state: GraphState, config: Optional[Dict[str, Any]] = None) -> None:
         self.node_ids: Set[str] = {n.node_id for n in graph_state.nodes}
-        # node_id -> list of (neighbour_id, edge_id, weight)
         self.adj: Dict[str, List[Tuple[str, str, float]]] = defaultdict(list)
-        self._build(graph_state.edges)
+        self._build(graph_state.edges, config or {})
 
-    def _build(self, edges: List[GraphEdge]) -> None:
+    def _build(self, edges: List[GraphEdge], config: Dict[str, Any]) -> None:
+        f_factor = config.get("forward_weight_factor", 1.0)
+        b_factor = config.get("backward_weight_factor", 0.5)
+
         for e in edges:
             if e.source_node not in self.node_ids or e.target_node not in self.node_ids:
                 continue
-            w = max(e.confidence, 0.01)
-            self.adj[e.source_node].append((e.target_node, e.edge_id, w))
-            self.adj[e.target_node].append((e.source_node, e.edge_id, w))
+            base_w = max(e.confidence, 0.01)
+
+            # Forward edge (Source -> Target)
+            self.adj[e.source_node].append((e.target_node, e.edge_id, base_w * f_factor))
+            # Backward edge (Target -> Source)
+            self.adj[e.target_node].append((e.source_node, e.edge_id, base_w * b_factor))
 
     def neighbours(self, node_id: str) -> List[Tuple[str, str, float]]:
         return self.adj.get(node_id, [])
 
     def out_weight(self, node_id: str) -> float:
         return sum(w for _, _, w in self.neighbours(node_id)) or 1.0
-
 
 # ============================================================================
 # PPR ENGINE
@@ -108,7 +105,11 @@ class PPRTraversal:
         where *d* is the damping factor and *s* is the personalisation
         vector (uniform over seed nodes, zero elsewhere).
         """
-        graph = _AdjacencyGraph(inp.graph_state)
+        trav_cfg = {
+            "forward_weight_factor": inp.forward_weight_factor,
+            "backward_weight_factor": inp.backward_weight_factor,
+        }
+        graph = _AdjacencyGraph(inp.graph_state, config=trav_cfg)
         all_nodes = list(graph.node_ids)
 
         if not all_nodes:
@@ -133,18 +134,20 @@ class PPRTraversal:
         converged_at = inp.max_iterations
 
         for iteration in range(1, inp.max_iterations + 1):
-            new_scores: Dict[str, float] = {}
+            # Initialise new scores with the teleport (personalisation) component
+            new_scores: Dict[str, float] = {
+                n: teleport * personal.get(n, 0.0) for n in all_nodes
+            }
 
-            for node in all_nodes:
-                # Teleport component
-                rank = teleport * personal.get(node, 0.0)
-
-                # Diffusion component
-                for neighbour, _, weight in graph.neighbours(node):
-                    out_w = graph.out_weight(neighbour)
-                    rank += damping * scores[neighbour] * (weight / out_w)
-
-                new_scores[node] = rank
+            # Push component: distribute current scores to neighbors
+            for u in all_nodes:
+                score_u = scores.get(u, 0.0)
+                if score_u == 0:
+                    continue
+                
+                out_w = graph.out_weight(u)
+                for v, _, weight_u_v in graph.neighbours(u):
+                    new_scores[v] += damping * score_u * (weight_u_v / out_w)
 
             # Check convergence (L1 norm)
             delta = sum(abs(new_scores[n] - scores[n]) for n in all_nodes)

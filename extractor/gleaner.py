@@ -29,8 +29,9 @@ def glean_missing(
     chunk: TextChunk,
     entities: List[ExtractedEntity],
     claims: List[ExtractedClaim],
-    max_iter: int = 2,
+    max_iter: int = 1,
     skip_below_tokens: int = 800,
+    num_ctx: Optional[int] = None,
 ) -> GleaningResult:
     """Iteratively glean missed entities and claims from a chunk.
 
@@ -48,6 +49,8 @@ def glean_missing(
         Maximum gleaning iterations.
     skip_below_tokens:
         Skip gleaning for chunks with fewer tokens than this threshold.
+    num_ctx:
+        Optional context window size.
 
     Returns
     -------
@@ -75,7 +78,7 @@ def glean_missing(
     for iteration in range(max_iter):
         iterations = iteration + 1
         prompt = _build_prompt(chunk, current_entities, current_claims)
-        raw_response = llm_client.generate(prompt)
+        raw_response = llm_client.generate(prompt, num_ctx=num_ctx)
 
         # Check for completion signal
         if "EXTRACTION COMPLETE" in raw_response:
@@ -113,26 +116,11 @@ def _build_prompt(
         f"  - {c.claim_text}" for c in claims
     ) if claims else "  (none)"
 
-    # ENHANCEMENT (H4): This gleaning prompt operates on a single chunk in
-    # isolation.  A future enhancement could inject a "corpus context" summary
-    # of entities seen in other chunks, enabling the LLM to recover cross-chunk
-    # comparative claims (e.g., "Contract A sets a higher liability cap than
-    # Contract B").  See docs/investigations/EXTRACTOR_INVESTIGATION.md §H4.
     return (
-        "Examine the text again carefully. The following entities and claims "
-        "have already been extracted. Find any ADDITIONAL entities or claims "
-        "that were missed.\n\n"
-        f"Already extracted entities: {entity_list}\n\n"
-        f"Already extracted claims:\n{claim_list}\n\n"
-        "If you believe the extraction is complete and nothing was missed, "
-        'respond with exactly: "EXTRACTION COMPLETE"\n\n'
-        "Otherwise, return a JSON object with:\n"
-        '- "entities": array of {"surface_form": ..., "entity_type": ..., "description": ...}\n'
-        '- "claims": array of {"claim": ..., "subject": ..., "object": ..., '
-        '"predicate": ..., "description": ..., "confidence": ...}\n\n'
-        f"--- TEXT (chunk {chunk.chunk_id}) ---\n"
-        f"{chunk.text}\n"
-        "--- END TEXT ---"
+        "Re-examine the text for any ADDITIONAL entities or claims involving subjects "
+        "NOT listed here: " + entity_list + "\n\n"
+        "Return ONLY new findings in JSON. If complete, respond: EXTRACTION COMPLETE\n"
+        "..."
     )
 
 

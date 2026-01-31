@@ -151,6 +151,8 @@ class SciFactTestCase:
     claim_text: str
     expected_verdict: SciFactVerdict
     expected_evidence: Dict[str, List[int]]  # doc_id -> sentence indices
+    cited_doc_ids: List[str] = field(default_factory=list)  # all cited docs for recall
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -21,6 +21,7 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 from schemas.contracts import (
+    AliasMap,
     ConfidenceFactors,
     EpistemicRelationship,
     Finding,
@@ -49,6 +50,8 @@ from reasoner.evidence_grounder import ground_evidence
 from reasoner.verdict_resolver import (
     calculate_confidence,
     determine_verdict_type,
+    SUPPORTING,
+    CONTRADICTING,
 )
 
 
@@ -61,6 +64,64 @@ def _parse_response_json(raw_response: str) -> Dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         pass
     return {}
+
+
+def resolve_aliases(
+    parsed: Dict[str, Any],
+    alias_map: Optional[AliasMap],
+) -> Dict[str, Any]:
+    """Resolve [D1], [C1] aliases in LLM output to full metadata.
+    
+    Modifies source_id, target_id, and source_document fields in-place.
+    Falls back to extracting aliases from claim/quote text if fields are empty.
+    """
+    if not alias_map:
+        return parsed
+    
+    mappings = alias_map.mappings
+    
+    def _resolve_id(alias: str) -> str:
+        """Resolve alias like [D1] to doc_id."""
+        if alias in mappings:
+            return mappings[alias].doc_id
+        return alias
+    
+    def _extract_alias_from_text(text: str) -> Optional[str]:
+        """Extract first [D#] or [C#] pattern from text."""
+        match = re.search(r'\[(?:D|C)\d+\]', text)
+        return match.group() if match else None
+    
+    # Resolve relationships
+    for rel in parsed.get("relationships", []):
+        if "source_id" in rel:
+            rel["source_id"] = _resolve_id(rel["source_id"])
+        if "target_id" in rel:
+            rel["target_id"] = _resolve_id(rel["target_id"])
+    
+    # Resolve evidence with fallback extraction
+    for ev in parsed.get("evidence", []):
+        source_doc = ev.get("source_document", "")
+        
+        # If source_document is empty, try to extract from claim or quote
+        if not source_doc or source_doc.strip() == "":
+            # Try claim text first
+            claim_text = ev.get("claim", "")
+            alias = _extract_alias_from_text(claim_text)
+            
+            # Fall back to exact_quote
+            if not alias:
+                quote = ev.get("exact_quote", "")
+                alias = _extract_alias_from_text(quote)
+            
+            if alias:
+                ev["source_document"] = _resolve_id(alias)
+        else:
+            # Resolve existing alias
+            ev["source_document"] = _resolve_id(source_doc)
+    
+    return parsed
+
+
 
 
 class ReasonerController:
@@ -168,7 +229,8 @@ class ReasonerController:
         prompt = build_hybrid_prompt(
             input.query,
             focused=input.focused_context,
-            targeted=input.targeted_context
+            targeted=input.targeted_context,
+            alias_map=input.alias_map,
         )
 
         # --- Guard: detect empty context before calling LLM ---
@@ -181,7 +243,9 @@ class ReasonerController:
 
         # --- Step 2: Call LLM ---
         llm_start = time.time()
-        raw_response = self._llm.generate(prompt)
+        reasoning_cfg = self._config.get("reasoning", {})
+        num_ctx = reasoning_cfg.get("num_ctx", 8192)
+        raw_response = self._llm.generate(prompt, num_ctx=num_ctx)
         llm_time_ms = (time.time() - llm_start) * 1000
 
         # --- Step 3: Extract relationships ---
@@ -209,6 +273,10 @@ class ReasonerController:
 
         # Also extract evidence claims from parsed JSON
         parsed = _parse_response_json(raw_response)
+        
+        # --- Step 5.1: Resolve aliases to full metadata ---
+        parsed = resolve_aliases(parsed, input.alias_map)
+        
         for ev in parsed.get("evidence", []):
             claim = ev.get("exact_quote") or ev.get("claim", "")
             if claim and claim not in claims:
@@ -218,7 +286,21 @@ class ReasonerController:
         evidence = ground_evidence(claims, documents, chunks)
 
         # --- Step 7: Determine verdict type ---
-        verdict_type = determine_verdict_type(relationships, evidence)
+        # Prioritize the LLM's explicit verdict if available and valid
+        llm_verdict_str = parsed.get("verdict", {}).get("verdict_type")
+        verdict_type = None
+        
+        if llm_verdict_str:
+            try:
+                # Normalize and try to parse
+                verdict_type = VerdictType(llm_verdict_str.upper())
+            except ValueError:
+                logger.warning(f"Invalid verdict type from LLM: {llm_verdict_str}")
+                pass
+        
+        # Fallback to calculated verdict if LLM didn't provide one or it was invalid
+        if not verdict_type:
+            verdict_type = determine_verdict_type(relationships, evidence)
 
         # --- Step 8: Calculate raw confidence ---
         confidence_factors = calculate_confidence(relationships, evidence)
@@ -245,16 +327,28 @@ class ReasonerController:
         answer = verdict_block.get("answer", "")
         summary = verdict_block.get("summary", "")
 
-        primary_relationship: Optional[EpistemicRelationship] = None
+        primary_relationship = None
         if relationships:
             counter = Counter(r.relationship for r in relationships)
             primary_relationship = counter.most_common(1)[0][0]
+
+        # Calculate representative z_score for the verdict
+        verdict_z = 0.0
+        if relationships:
+            if verdict_type in [VerdictType.REFUTED, VerdictType.PARTIALLY_REFUTED]:
+                verdict_z = max((r.z_score for r in relationships if r.relationship in CONTRADICTING), default=0.0)
+            elif verdict_type in [VerdictType.CONFIRMED, VerdictType.PARTIALLY_CONFIRMED]:
+                verdict_z = max((r.z_score for r in relationships if r.relationship in SUPPORTING), default=0.0)
+            else:
+                # For Inconclusive/Not Found, just take max across all
+                verdict_z = max((r.z_score for r in relationships), default=0.0)
 
         verdict = Verdict(
             verdict_type=verdict_type,
             answer=answer,
             confidence=final_confidence,
             summary=summary,
+            z_score=verdict_z,
             primary_relationship=primary_relationship,
         )
 
@@ -312,6 +406,7 @@ class ReasonerController:
             verdict_confidence=final_confidence,
             llm_time_ms=llm_time_ms,
             total_time_ms=total_time_ms,
+            z_score=verdict_z,
             final_prompt=prompt,
             prompt_token_count=len(prompt) // 4,
         )

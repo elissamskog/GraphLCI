@@ -54,6 +54,7 @@ def extract_relationships(llm_response: str) -> List[InferredRelationship]:
                 target_id=rel.get("target_id", ""),
                 relationship=relationship,
                 confidence=confidence,
+                z_score=confidence,  # Map LLM confidence to raw z_score
                 reasoning=rel.get("reasoning", ""),
                 evidence_quote=rel.get("evidence_quote"),
             ))

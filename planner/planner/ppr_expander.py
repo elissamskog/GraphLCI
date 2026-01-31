@@ -8,8 +8,9 @@ Personalized PageRank expansion from seed nodes to define query scope.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 from schemas.contracts import (
     KnowledgeGraph,
@@ -26,6 +27,8 @@ def personalized_pagerank(
     alpha: float = 0.85,
     max_iterations: int = 50,
     tolerance: float = 1e-6,
+    degree_discount: bool = True,
+    seed_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Run Personalized PageRank from seed nodes.
 
@@ -41,6 +44,13 @@ def personalized_pagerank(
         Maximum PPR iterations.
     tolerance:
         Convergence tolerance.
+    degree_discount:
+        If True, apply log2 normalization on out-weights to prevent
+        high-degree hub nodes from absorbing probability mass.
+    seed_weights:
+        Optional dict mapping node_id to priority weight multiplier.
+        Used for weighted seeding (primary=2.0x, bridge=1.5x, secondary=1.0x).
+        If None, all seeds get equal weight.
 
     Returns
     -------
@@ -72,26 +82,39 @@ def personalized_pagerank(
             if neighbour in graph.nodes:
                 adj[node_id].append((neighbour, w))
 
-    # Compute out-weights
+    # Compute out-weights (optionally degree-discounted)
+    node_degree: Dict[str, int] = {n: len(adj.get(n, [])) for n in all_nodes}
     out_weight: Dict[str, float] = {}
     for node_id in all_nodes:
-        total = sum(w for _, w in adj.get(node_id, []))
+        neighbors = adj.get(node_id, [])
+        if degree_discount:
+            # Discount each neighbor's contribution by its own degree
+            total = sum(
+                w / math.log2(node_degree.get(nbr, 1) + 2)
+                for nbr, w in neighbors
+            )
+        else:
+            total = sum(w for _, w in neighbors)
         out_weight[node_id] = total if total > 0 else 1.0
 
     # Personalization vector: weighted by node specificity s_i = 1 / |P_i|
+    # and priority weight (from subclaim decomposition).
     # Rare nodes (fewer chunks) get higher initial weight.
     personal: Dict[str, float] = defaultdict(float)
     total_specificity = 0.0
-    
+
     for s in valid_seeds:
         node = graph.nodes.get(s)
-        # Default to 1 chunk if unknown or empty (though valid_seeds ensures presence in graph.nodes mostly, 
-        # but graph.nodes might differ from graph.adjacency keys if data is messy. 
-        # The 'valid_seeds' check above checked graph.nodes presence? 
-        # No, it checked 'if s in graph.nodes'. So node should exist.)
         chunk_count = len(node.source_chunks) if node else 1
-        # Specificity s_i
-        w = 1.0 / max(chunk_count, 1)
+
+        # Base specificity (anti-hub bias)
+        w_specificity = 1.0 / max(chunk_count, 1)
+
+        # Priority weight (from subclaim decomposition)
+        w_priority = seed_weights.get(s, 1.0) if seed_weights else 1.0
+
+        # Combined weight
+        w = w_specificity * w_priority
         personal[s] = w
         total_specificity += w
 
@@ -119,6 +142,9 @@ def personalized_pagerank(
 
             # Diffusion component: sum over neighbours that point to this node
             for neighbour, weight in adj.get(node, []):
+                if degree_discount:
+                     weight /= math.log2(node_degree.get(node, 1) + 2)
+                
                 rank += alpha * scores[neighbour] * (weight / out_weight[neighbour])
 
             new_scores[node] = rank
@@ -139,6 +165,7 @@ def extract_scope(
     seed_node_ids: List[str],
     top_k: int = 50,
     min_score: float = 0.01,
+    prefer_claims: bool = True,
 ) -> Scope:
     """Extract a scope subgraph from PPR scores.
 
@@ -154,22 +181,47 @@ def extract_scope(
         Maximum nodes in scope.
     min_score:
         Minimum PPR score to include.
+    prefer_claims:
+        If True, prioritize CLAIM nodes over ENTITY nodes by boosting
+        CLAIM scores. This ensures factual assertions are included
+        in the scope rather than just entity labels.
 
     Returns
     -------
     Scope
         The scoped subgraph with nodes, edges, and document IDs.
     """
-    # Sort nodes by PPR score descending, filter by min_score, cap at top_k
+    # Sort nodes by PPR score descending, filter by min_score
+
     sorted_nodes = sorted(ppr_scores.items(), key=lambda x: x[1], reverse=True)
-    selected: List[Tuple[str, float]] = []
+    candidates: List[Tuple[str, float]] = []
     for node_id, score in sorted_nodes:
         if score < min_score:
-            break  # sorted descending, so all remaining are below threshold
-        if node_id in graph.nodes:
-            selected.append((node_id, score))
-        if len(selected) >= top_k:
             break
+        if node_id in graph.nodes:
+            candidates.append((node_id, score))
+    
+    # If prefer_claims, re-rank to prioritize CLAIM nodes
+    if prefer_claims:
+        def node_priority(item: Tuple[str, float]) -> Tuple[int, float]:
+            """Sort key: (type_priority, -ppr_score). Lower priority = better."""
+            node_id, score = item
+            node = graph.nodes.get(node_id)
+            if node is None:
+                return (2, -score)  # Unknown nodes last
+            # node_type is a string: "ENTITY", "CLAIM", etc.
+            if node.node_type == "CLAIM":
+                return (0, -score)  # Claims first
+            elif node.node_type == "ENTITY":
+                return (1, -score)  # Entities second
+            else:
+                return (2, -score)  # Others last
+        
+        candidates.sort(key=node_priority)
+    
+    selected: List[Tuple[str, float]] = candidates[:top_k]
+
+
 
     selected_ids: Set[str] = {node_id for node_id, _ in selected}
 

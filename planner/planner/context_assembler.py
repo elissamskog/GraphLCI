@@ -8,10 +8,13 @@ Assembles context payloads for each lane type from the scoped subgraph.
 
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from schemas.contracts import (
+    AliasedDocument,
+    AliasMap,
     CommunityStructure,
     FocusedContext,
     GlobalContext,
@@ -43,10 +46,11 @@ def assemble_focused_context(
     scope: Scope,
     graph: KnowledgeGraph,
     document_store: Dict[str, RawDocument],
-) -> FocusedContext:
+) -> Tuple[FocusedContext, AliasMap]:
     """Assemble focused context for Lane A (Graph-LCI).
 
     Builds edge grammar, node context, and includes full documents.
+    Also generates an AliasMap for provenance tracking.
 
     Parameters
     ----------
@@ -59,14 +63,25 @@ def assemble_focused_context(
 
     Returns
     -------
-    FocusedContext
-        Context with documents, edge grammar, and node context.
+    Tuple[FocusedContext, AliasMap]
+        Context with documents, edge grammar, node context, and alias map.
     """
-    # 1. Collect documents referenced by scope
+    # 1. Collect documents referenced by scope and build alias map
     documents: Dict[str, RawDocument] = {}
-    for doc_id in scope.document_ids:
+    alias_mappings: Dict[str, AliasedDocument] = {}
+    
+    for i, doc_id in enumerate(scope.document_ids):
         if doc_id in document_store:
             documents[doc_id] = document_store[doc_id]
+            alias = f"[D{i + 1}]"
+            doc_uid = uuid.uuid4().hex
+            alias_mappings[alias] = AliasedDocument(
+                alias=alias,
+                uid=doc_uid,
+                doc_id=doc_id,
+                chunk_id=None,
+                source_url=document_store[doc_id].metadata.get("source_url"),
+            )
 
     # 2. Build edge grammar string
     edge_grammar = _build_edge_grammar(scope, graph)
@@ -74,12 +89,15 @@ def assemble_focused_context(
     # 3. Build node context string
     node_context = _build_node_context(scope)
 
-    return FocusedContext(
+    focused = FocusedContext(
         documents=documents,
         edge_grammar=edge_grammar,
         node_context=node_context,
         scope=scope,
     )
+    alias_map = AliasMap(mappings=alias_mappings)
+    
+    return focused, alias_map
 
 
 def _build_edge_grammar(scope: Scope, graph: KnowledgeGraph) -> str:
@@ -195,10 +213,11 @@ def assemble_targeted_context(
     scope: Scope,
     chunks: List[TextChunk],
     query_embedding: List[float],
-) -> TargetedContext:
+) -> Tuple[TargetedContext, AliasMap]:
     """Assemble targeted context for Lane C (Vector-only).
 
     Ranks chunks by relevance using PPR scores of nodes that reference them.
+    Also generates an AliasMap for provenance tracking.
 
     Parameters
     ----------
@@ -211,8 +230,8 @@ def assemble_targeted_context(
 
     Returns
     -------
-    TargetedContext
-        Context with ranked chunks.
+    Tuple[TargetedContext, AliasMap]
+        Context with ranked chunks and alias map.
     """
     # Map chunk_id -> max PPR score across scope nodes referencing that chunk
     chunk_scores: Dict[str, float] = {}
@@ -236,7 +255,23 @@ def assemble_targeted_context(
     # Cap at 20
     ranked = ranked[:20]
 
-    return TargetedContext(
+    # Build alias map for chunks
+    alias_mappings: Dict[str, AliasedDocument] = {}
+    for i, rc in enumerate(ranked):
+        alias = f"[C{i + 1}]"
+        chunk_uid = uuid.uuid4().hex
+        alias_mappings[alias] = AliasedDocument(
+            alias=alias,
+            uid=chunk_uid,
+            doc_id=rc.chunk.source_doc_id,
+            chunk_id=rc.chunk.chunk_id,
+            source_url=None,
+        )
+
+    targeted = TargetedContext(
         chunks=ranked,
         scope=scope,
     )
+    alias_map = AliasMap(mappings=alias_mappings)
+    
+    return targeted, alias_map

@@ -1,0 +1,33 @@
+llm:
+  # Provider options: ollama, mlx, mock
+  provider: mlx
+  # Default model if not specified in provider section
+  model: qwen2.5:14b
+
+embedding:
+  provider: sentence_transformers
+  model: nomic-ai/nomic-embed-text-v1.5
+
+# MLX Configuration (Mac M4 Optimized)
+mlx:
+  model: mlx-community/Qwen2.5-14B-Instruct-4bit
+  num_ctx: 10000
+  # Optional path to LoRA adapters
+  adapter_path: null
+
+# Ollama Configuration (Legacy/Fallback)
+ollama:
+  base_url: "http://localhost:11434"
+
+# SentenceTransformers Configuration
+sentence_transformers:
+  model: nomic-ai/nomic-embed-text-v1.5
+
+# Provider behavior settings
+providers:
+  mlx:
+    trust_remote_code: true
+
+data:
+  multihop_path: "/Users/elis/Projects/RAG_LCI/data/raw/multihop"
+  scifact_path: "/Users/elis/Projects/RAG_LCI/data/raw/scifact/data"

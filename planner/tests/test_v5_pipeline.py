@@ -20,6 +20,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from typing import Any, Dict, List, Optional, Tuple
 
 from schemas.contracts import (
+    AliasedDocument,
+    AliasMap,
     Community,
     CommunityStructure,
     EmbeddedNode,
@@ -400,14 +402,14 @@ def test_extract_scope():
 
 
 def test_assemble_focused_context():
-    """Verify documents, edge grammar, node context for Lane A."""
+    """Verify documents, edge grammar, node context, and AliasMap for Lane A."""
     graph = build_test_graph()
     seed_ids = ["msa_n0", "dora_n0"]
     scores = personalized_pagerank(graph, seed_ids)
     scope = extract_scope(graph, scores, seed_ids, top_k=10, min_score=0.001)
     doc_store = build_test_document_store()
 
-    ctx = assemble_focused_context(scope, graph, doc_store)
+    ctx, alias_map = assemble_focused_context(scope, graph, doc_store)
     assert isinstance(ctx, FocusedContext)
     assert len(ctx.documents) > 0
     assert isinstance(ctx.edge_grammar, str)
@@ -415,6 +417,12 @@ def test_assemble_focused_context():
     assert isinstance(ctx.node_context, str)
     assert len(ctx.node_context) > 0
     assert ctx.scope is scope
+    # Verify AliasMap
+    assert isinstance(alias_map, AliasMap)
+    assert len(alias_map.mappings) > 0
+    for alias, doc in alias_map.mappings.items():
+        assert alias.startswith("[D")
+        assert isinstance(doc, AliasedDocument)
 
 
 # test_assemble_global_context removed
@@ -422,7 +430,7 @@ def test_assemble_focused_context():
 
 
 def test_assemble_targeted_context():
-    """Verify chunks ranked and capped at 20."""
+    """Verify chunks ranked, capped at 20, and AliasMap generated."""
     graph = build_test_graph()
     seed_ids = ["msa_n0", "dora_n0"]
     scores = personalized_pagerank(graph, seed_ids)
@@ -430,7 +438,7 @@ def test_assemble_targeted_context():
     chunks = build_test_chunks(graph)
     query_emb = _make_embedding("liability")
 
-    ctx = assemble_targeted_context(scope, chunks, query_emb)
+    ctx, alias_map = assemble_targeted_context(scope, chunks, query_emb)
     assert isinstance(ctx, TargetedContext)
     assert len(ctx.chunks) <= 20
     assert len(ctx.chunks) > 0
@@ -438,6 +446,12 @@ def test_assemble_targeted_context():
     for i in range(len(ctx.chunks) - 1):
         assert ctx.chunks[i].relevance_score >= ctx.chunks[i + 1].relevance_score
     assert ctx.scope is scope
+    # Verify AliasMap
+    assert isinstance(alias_map, AliasMap)
+    assert len(alias_map.mappings) == len(ctx.chunks)
+    for alias, doc in alias_map.mappings.items():
+        assert alias.startswith("[C")
+        assert isinstance(doc, AliasedDocument)
 
 
 # ============================================================================

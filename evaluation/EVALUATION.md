@@ -14,16 +14,22 @@ This document describes the v5 evaluation framework for KnowledgeAudit. The fram
 Entry point: `python -m evaluation.run_evaluation_v5 --dataset scifact`
 
 ### WikiFactClaims
+WikiFactClaims is a multi-hop reasoning benchmark derived from HotpotQA. Each row contains a question, 10 context passages, supporting-fact annotations, and 3 derived claims.
 
-WikiFactClaims is a multi-hop reasoning benchmark derived from HotpotQA. Each row contains a question, 10 context passages, supporting-fact annotations, and 3 derived claims. `WikiFactClaimsLoader` loads from a local JSONL file and yields:
-
-- **Per-row corpus:** 10 Wikipedia passages (indexed independently per row)
-- **Claims:** 3 claims per row, each labeled SUPPORTS / REFUTES / NOT_ENOUGH_INFO
-- **Metadata:** Question type (comparison / bridge) and difficulty level (medium / hard)
-
-The key structural difference from SciFact: context passages are inline per-row, so the knowledge graph is built per-row rather than against a global corpus.
+- **Corpus:** 10 Wikipedia passages per row (indexed independently).
+- **Claims:** 3 claims per row (SUPPORTS / REFUTES / NOT_ENOUGH_INFO).
+- **Metric Focus:** Reasoning over distracting contexts.
 
 Entry point: `python -m evaluation.run_evaluation_v5 --dataset wikifactclaims`
+
+### MuSiQue
+[MuSiQue](https://github.com/stonybrooknlp/musique) (Multi-hop Significance Questions) is a multi-hop QA dataset. We evaluate it in a retrieval-augmented verification setting.
+
+- **Corpus:** "Gold" paragraphs + N "distractor" paragraphs per claim (indexed independently).
+- **Claims:** Derived from the question-answer pairs.
+- **Metric Focus:** Multi-hop reasoning and decomposition.
+
+Entry point: `python -m evaluation.run_evaluation_v5 --dataset musique`
 
 ### Shared Labels
 
@@ -72,24 +78,22 @@ A claim is **correct** when its mapped verdict matches the expected label.
 
 ## Metrics
 
-### Core Metrics (both benchmarks)
+### Core Metrics (all benchmarks)
 
 | Metric | Definition |
 |---|---|
-| **Verdict Accuracy** | Fraction of completed claims where mapped verdict == expected label |
-| **Mean Confidence** | Average of the reasoner's confidence score (0–1) across completed claims |
+| **Verdict Accuracy** | Fraction of completed claims where mapped verdict matches expected label. |
+| **Mean Confidence** | Average of the reasoner's confidence score (0–1). |
 
-### SciFact-Specific
+### Recall Metrics (Retrieval & Scope)
 
-| Metric | Definition |
-|---|---|
-| **Evidence Doc Recall** | Per-claim: \|predicted evidence doc IDs ∩ expected doc IDs\| / \|expected doc IDs\|. Averaged across claims. Claims with no expected evidence get recall = 1.0 |
+| Metric | Purpose | Definition |
+|---|---|---|
+| **Evidence Doc Recall** | **Final Output Quality** | Fraction of expected "Gold" documents that were cited in the *Final Verdict* evidence. Measures if the Reasoner correctly used the right docs. |
+| **Planner Scope Recall** | **Intermediate Retrieval Quality** | Fraction of expected "Gold" documents that were present in the *Planner's Scope* (passed to Reasoner). Equivalent to "Chunk Recall" or "Passage Recall@k". High scope recall + Low doc recall = Reasoning Failure. |
+| **Graph Recall@K** | **Index Quality** | (SciFact Only) Fraction of expected "Gold" documents that exist as nodes in the *Knowledge Graph*. Measures if the Indexer successfully captured the document. |
 
 ### WikiFactClaims-Specific
-
-| Metric | Definition |
-|---|---|
-| **Planner Scope Recall** | Per-claim: \|supporting-fact titles in planner scope\| / \|total supporting-fact titles\|. Averaged across claims |
 | **Per-Type Accuracy** | Verdict accuracy broken down by question type (comparison / bridge) |
 | **Per-Level Accuracy** | Verdict accuracy broken down by difficulty level (medium / hard) |
 
@@ -193,19 +197,26 @@ The amount of detail captured depends on `--trace-level`:
 
 ## Output Files
 
-### SciFact
+The evaluation runner produces standardized outputs for all datasets.
 
-| File | Content |
-|---|---|
-| `output.md` | Human-readable report: configuration, summary metrics, two-stage failure analysis, per-verdict breakdown, confusion matrix, per-claim results table, error log |
-| `output.trace.json` | Machine-readable trace: config, index stats, aggregate metrics, confusion matrix, per-verdict accuracy, index diagnostics (chunker/extractor/librarian/coreference/cross-doc overlap), and per-claim traces |
-| `output.md.checkpoint.json` | Partial results written every 10 claims for crash recovery. Deleted on successful completion |
+### Readable Report (`{dataset}_output.md`)
+A human-readable markdown report containing:
+- **Configuration**: Model, data, and time.
+- **Summary Metrics**: Accuracy, Precision, Recall table.
+- **Failure Analysis**: (If supported) Two-stage breakdown of retrieval vs. reasoning failures.
+- **Per-Verdict Breakdown**: Confusion matrix and per-class alignment.
+- **Claim Results**: Detailed table of every evaluated claim with links to the full trace.
 
-### WikiFactClaims
+### Machine Trace (`{dataset}_output.trace.json`)
+A comprehensive JSON log of the entire execution. Key fields:
 
-| File | Content |
-|---|---|
-| `wiki_output.md` | Human-readable report: configuration, summary metrics, per-verdict breakdown, per-type accuracy, per-level accuracy, confusion matrix, per-row summary, per-claim results, error log |
+- `metrics`: Aggregate scores (Accuracy, Recall, etc.).
+- `groups`: List of processed groups (e.g., one group for SciFact, many for Wiki/MuSiQue).
+    - `index_stats`: Graph size, extraction stats, and timings.
+    - `claim_traces`: List of detailed traces for each claim:
+        - `planner_trace`: Seeds found, scope nodes, selected lane, router confidence.
+        - `reasoner_trace`: Final verdict, reasoning thought chain, evidence used.
+        - `two_stage_failure`: (If applicable) Detailed attribution of failure (Graph vs Planner vs Reasoner).
 
 ## Corpus Modes (SciFact)
 

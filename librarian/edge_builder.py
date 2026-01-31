@@ -8,6 +8,7 @@ Creates structural edges from node embeddings and explicit relationships.
 
 from __future__ import annotations
 
+import math
 import uuid
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -126,13 +127,15 @@ def extract_explicit_edges(
         if len(group) < 2:
             continue
         hub = group[0]
+        # Log-normalize weight to penalize high-degree hubs
+        hub_weight = 1.0 / math.log2(len(group) + 1)
         for spoke in group[1:]:
             edges.append(StructuralEdge(
                 edge_id=_make_edge_id(),
                 source=hub,
                 target=spoke,
                 edge_type=StructuralEdgeType.SAME_SOURCE,
-                weight=1.0,
+                weight=hub_weight,
                 metadata={"origin": "same_source", "doc_id": doc_id},
                 similarity=None,
                 is_cross_document=False,
@@ -157,6 +160,8 @@ def extract_explicit_edges(
         if len(group) < 2:
             continue
         hub = group[0]
+        # Log-normalize weight to penalize high-degree hubs
+        chunk_hub_weight = 1.0 / math.log2(len(group) + 1)
         for spoke in group[1:]:
             if hub == spoke:
                 continue
@@ -165,10 +170,21 @@ def extract_explicit_edges(
                 source=hub,
                 target=spoke,
                 edge_type=StructuralEdgeType.SAME_CHUNK,
-                weight=1.0,
+                weight=chunk_hub_weight,
                 metadata={"origin": "same_chunk", "chunk_id": chunk_id},
                 similarity=None,
                 is_cross_document=_is_cross_document(hub, spoke, nodes),
+            ))
+            # Bidirectional: Spoke -> Hub
+            edges.append(StructuralEdge(
+                edge_id=_make_edge_id(),
+                source=spoke,
+                target=hub,
+                edge_type=StructuralEdgeType.SAME_CHUNK,
+                weight=chunk_hub_weight,
+                metadata={"origin": "same_chunk", "chunk_id": chunk_id},
+                similarity=None,
+                is_cross_document=_is_cross_document(spoke, hub, nodes),
             ))
 
     return edges
@@ -466,5 +482,80 @@ def create_synonymy_edges(
                 similarity=sim,
                 is_cross_document=_is_cross_document(a, b, nodes),
             ))
+
+    return edges
+
+
+def boost_bridge_edges(
+    edges: List[StructuralEdge],
+    multiplier: float = 1.5,
+) -> List[StructuralEdge]:
+    """Apply a weight multiplier to cross-document (bridge) edges.
+
+    This encourages PPR mass to preferentially flow across document
+    boundaries, counteracting the Semantic Sink effect where intra-
+    document hub nodes absorb disproportionate mass.
+
+    Parameters
+    ----------
+    edges:
+        All structural edges (modified in-place and returned).
+    multiplier:
+        Weight multiplier for ``is_cross_document=True`` edges.
+
+    Returns
+    -------
+    List[StructuralEdge]
+        The same list with bridge edge weights boosted.
+    """
+    for edge in edges:
+        if edge.is_cross_document:
+            edge.weight *= multiplier
+    return edges
+
+
+def discount_synonymy_by_degree(
+    edges: List[StructuralEdge],
+    nodes: Dict[str, EmbeddedNode],
+) -> List[StructuralEdge]:
+    """Apply degree-based discount to SYNONYMY edges to prevent similarity clusters.
+
+    High-degree nodes in similarity clusters (e.g., multiple claims about "Elias
+    Thorne graduated") create a "Similarity Web" that traps PPR mass. This function
+    reduces SYNONYMY edge weights based on the average degree of the endpoints,
+    preventing high-weight clusters from dominating scope selection.
+
+    Formula: discounted_weight = original_weight / log2(avg_degree + 2)
+
+    Parameters
+    ----------
+    edges:
+        All structural edges (SYNONYMY edges modified in-place).
+    nodes:
+        All nodes in the graph (used to validate endpoints exist).
+
+    Returns
+    -------
+    List[StructuralEdge]
+        The same list with SYNONYMY edge weights discounted by degree.
+    """
+    # Compute degree for each node
+    from collections import defaultdict
+    degree: Dict[str, int] = defaultdict(int)
+    for edge in edges:
+        if edge.source in nodes:
+            degree[edge.source] += 1
+        if edge.target in nodes:
+            degree[edge.target] += 1
+
+    # Discount SYNONYMY edges based on average endpoint degree
+    for edge in edges:
+        if edge.edge_type != StructuralEdgeType.SYNONYMY:
+            continue
+        src_degree = degree.get(edge.source, 0)
+        tgt_degree = degree.get(edge.target, 0)
+        avg_degree = (src_degree + tgt_degree) / 2.0
+        discount_factor = math.log2(avg_degree + 2)
+        edge.weight /= discount_factor
 
     return edges

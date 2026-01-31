@@ -14,6 +14,7 @@ import logging
 import sys
 import os
 import time as _time
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,9 +31,6 @@ if _PLANNER_DIR not in sys.path:
 
 from schemas.contracts import (
     AssembledContext,
-    ExplorationRequest,
-    ExplorationResponse,
-    ExplorationResult,
     IndexedCorpus,
     IndexRequest,
     LLMClient,
@@ -58,12 +56,7 @@ from schemas.contracts import (
     ReasonerOutput,
     Finding,
 )
-from planner_controller import PlannerController
-from librarian.librarian_controller import LibrarianController
-# from explorer.explorer_controller import ExplorerController  # DEPRECATED/REMOVED
-from extractor.summarizer import Summarizer
-from extractor.domain_reasoner import DomainReasoner
-from llm_client import get_client, get_embedding_client, OllamaClient
+
 
 # v5 controllers
 # from explorer.explorer_controller import ExplorerControllerV5 # UNUSED
@@ -100,20 +93,7 @@ def _trace_summary(trace: Any) -> str:
 # ERROR CLASSES
 # ============================================================================
 
-class PlanningError(Exception):
-    """Raised when PlannerResponse.success is False."""
 
-
-class IndexingError(Exception):
-    """Raised when INDEX LibrarianResponse.success is False."""
-
-
-class ExplorationError(Exception):
-    """Raised when ExplorationResponse.success is False."""
-
-
-class AssemblyError(Exception):
-    """Raised when RESOLVE_AND_ASSEMBLE LibrarianResponse.success is False."""
 
 
 # ============================================================================
@@ -127,23 +107,26 @@ class TokenCountingWrapper:
         self._client = client
         self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._call_count = 0
+        self._lock = threading.Lock()
 
-    def generate(self, prompt: str) -> str:
-        result = self._client.generate(prompt)
-        self._call_count += 1
+    def generate(self, prompt: str, num_ctx: Optional[int] = None) -> str:
+        result = self._client.generate(prompt, num_ctx=num_ctx)
         usage = getattr(self._client, "last_usage", None)
-        if usage:
-            self._accumulated["prompt_tokens"] += usage.get("prompt_tokens", 0)
-            self._accumulated["completion_tokens"] += usage.get("completion_tokens", 0)
-            self._accumulated["total_tokens"] += usage.get("total_tokens", 0)
+        with self._lock:
+            self._call_count += 1
+            if usage:
+                self._accumulated["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                self._accumulated["completion_tokens"] += usage.get("completion_tokens", 0)
+                self._accumulated["total_tokens"] += usage.get("total_tokens", 0)
         return result
 
     def snapshot_and_reset(self) -> Dict[str, int]:
-        result = dict(self._accumulated)
-        result["call_count"] = self._call_count
-        self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        self._call_count = 0
-        return result
+        with self._lock:
+            result = dict(self._accumulated)
+            result["call_count"] = self._call_count
+            self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            self._call_count = 0
+            return result
 
     def __getattr__(self, name):
         return getattr(self._client, name)
@@ -156,23 +139,26 @@ class EmbeddingCountingWrapper:
         self._client = client
         self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._call_count = 0
+        self._lock = threading.Lock()
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         result = self._client.embed(texts)
-        self._call_count += 1
         usage = getattr(self._client, "last_usage", None)
-        if usage:
-            self._accumulated["prompt_tokens"] += usage.get("prompt_tokens", 0)
-            self._accumulated["completion_tokens"] += usage.get("completion_tokens", 0)
-            self._accumulated["total_tokens"] += usage.get("total_tokens", 0)
+        with self._lock:
+            self._call_count += 1
+            if usage:
+                self._accumulated["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                self._accumulated["completion_tokens"] += usage.get("completion_tokens", 0)
+                self._accumulated["total_tokens"] += usage.get("total_tokens", 0)
         return result
 
     def snapshot_and_reset(self) -> Dict[str, int]:
-        result = dict(self._accumulated)
-        result["call_count"] = self._call_count
-        self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        self._call_count = 0
-        return result
+        with self._lock:
+            result = dict(self._accumulated)
+            result["call_count"] = self._call_count
+            self._accumulated = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            self._call_count = 0
+            return result
 
     def __getattr__(self, name):
         return getattr(self._client, name)
@@ -182,216 +168,7 @@ class EmbeddingCountingWrapper:
 # ORCHESTRATOR
 # ============================================================================
 
-class Orchestrator:
-    """Coordinate PlannerController and LibrarianController.
 
-    Parameters
-    ----------
-    llm_client:
-        Object satisfying the ``LLMClient`` protocol.
-    config:
-        Dictionary with keys consumed by planner and librarian.
-    """
-
-    def __init__(self, llm_client: LLMClient, config: Dict[str, Any]) -> None:
-        self._config = config
-        self._last_exploration_result: Optional[ExplorationResult] = None
-
-        # -- Planner config --
-        self._planner_config: Dict[str, Any] = {
-            "available_documents": config.get("available_documents", []),
-            "known_entities": config.get("known_entities", []),
-            "corpus_metadata": config.get("corpus_metadata", {}),
-        }
-        self._planner = PlannerController(self._planner_config)
-
-        # -- Explorer config (Legacy Inlined) --
-        explorer_config: Dict[str, Any] = config.get("explorer", {})
-        # self._explorer = ExplorerController(llm_client, explorer_config)
-        self._summarizer = Summarizer(llm_client)
-        self._domain_reasoner = DomainReasoner(llm_client)
-
-        # -- Librarian config --
-        librarian_config: Dict[str, Any] = {
-            "indexer": config.get("indexer", {}),
-            "resolver": config.get("resolver", {}),
-            "assembler": config.get("assembler", {}),
-        }
-        self._librarian = LibrarianController(llm_client, librarian_config)
-
-    # ------------------------------------------------------------------
-    # INDEX pipeline
-    # ------------------------------------------------------------------
-
-    def index_corpus(self, corpus: RawCorpus) -> IndexedCorpus:
-        """Index a corpus of documents.
-
-        Two-stage pipeline:
-        1. **Exploration** — EXPLORER produces document summaries and a
-           domain taxonomy.
-        2. **Indexing** — LIBRARIAN indexes the corpus, enriched by
-           exploration results.
-
-        After indexing, updates the planner config with the newly-available
-        document IDs so that TargetExtractor can match them.
-        """
-        pipeline_t0 = _time.monotonic()
-        doc_count = len(corpus.documents)
-        logger.info("index_corpus START — %d documents", doc_count)
-
-        # Stage 1: Exploration
-        logger.info("EXPLORER START — %d documents", doc_count)
-        t0 = _time.monotonic()
-        try:
-            # Inline Exploration Logic
-            # Stage 1: summarize each document
-            summaries = [
-                self._summarizer.summarize(doc)
-                for doc in corpus.documents
-            ]
-            
-            # Stage 2: discover taxonomy
-            taxonomy = self._domain_reasoner.discover_taxonomy(summaries)
-            
-            exploration_result = ExplorationResult(
-                corpus_id=corpus.corpus_id,
-                summaries=summaries,
-                taxonomy=taxonomy,
-                exploration_metadata={
-                    "document_count": len(summaries),
-                    "domain_count": len(taxonomy.domains),
-                    "relationship_count": len(taxonomy.cross_domain_relationships),
-                },
-            )
-            # End Inline Logic
-
-        except Exception:
-            logger.exception("EXPLORER FAILED")
-            raise
-        elapsed = _time.monotonic() - t0
-        # ExplorationResponse check removed as we are now raising exceptions or returning result directly
-        
-        self._last_exploration_result = exploration_result
-        logger.info("EXPLORER DONE — %.2fs", elapsed)
-
-        # Stage 2: Indexing with exploration context
-        logger.info("LIBRARIAN INDEX START")
-        t0 = _time.monotonic()
-        try:
-            index_request = IndexRequest(corpus=corpus, exploration=exploration_result)
-            request = LibrarianRequest(request_type="INDEX", payload=index_request)
-            response = self._librarian.process(request)
-        except Exception:
-            logger.exception("LIBRARIAN INDEX FAILED")
-            raise
-        elapsed = _time.monotonic() - t0
-
-        if not response.success:
-            logger.error("LIBRARIAN INDEX returned errors: %s", response.errors)
-            raise IndexingError(
-                f"Indexing failed: {response.errors}"
-            )
-
-        node_count = len(response.payload.graph_state.nodes)
-        edge_count = len(response.payload.graph_state.edges)
-        logger.info(
-            "LIBRARIAN INDEX DONE — nodes=%d edges=%d elapsed=%.2fs",
-            node_count, edge_count, elapsed,
-        )
-
-        # Update planner with newly-available doc IDs
-        doc_ids = [doc.doc_id for doc in corpus.documents]
-        self._planner_config["available_documents"] = doc_ids
-        self._planner = PlannerController(self._planner_config)
-
-        total_elapsed = _time.monotonic() - pipeline_t0
-        logger.info("index_corpus DONE — total elapsed=%.2fs", total_elapsed)
-        return response.payload
-
-    @property
-    def last_exploration_result(self) -> Optional[ExplorationResult]:
-        """The most recent ``ExplorationResult`` from ``index_corpus``."""
-        return self._last_exploration_result
-
-    # ------------------------------------------------------------------
-    # QUERY pipeline
-    # ------------------------------------------------------------------
-
-    def process_query(
-        self, query: QueryRequest
-    ) -> Tuple[RouterDecision, Optional[AssembledContext]]:
-        """Route a query through planner and optionally assemble context.
-
-        Returns
-        -------
-        (RouterDecision, AssembledContext | None)
-            The router decision and, if graph scope is required, the
-            assembled LCI context.
-        """
-        pipeline_t0 = _time.monotonic()
-        logger.info("process_query START — query_id=%s", query.query_id)
-
-        # Step 1: Plan
-        logger.info("PLANNER START — query_id=%s", query.query_id)
-        t0 = _time.monotonic()
-        try:
-            planner_request = PlannerRequest(query_request=query)
-            planner_response = self._planner.process(planner_request)
-        except Exception:
-            logger.exception("PLANNER FAILED")
-            raise
-        elapsed = _time.monotonic() - t0
-
-        if not planner_response.success:
-            logger.error("PLANNER returned errors: %s", planner_response.errors)
-            raise PlanningError(
-                f"Planning failed: {planner_response.errors}"
-            )
-
-        router_decision = planner_response.router_decision
-        logger.info(
-            "PLANNER DONE — lane=%s strategy=%s scope=%s elapsed=%.2fs",
-            router_decision.selected_lane.value,
-            router_decision.search_strategy.classification.value,
-            router_decision.requires_graph_scope,
-            elapsed,
-        )
-
-        # Step 2: Optionally resolve scope and assemble context
-        if router_decision.requires_graph_scope:
-            logger.info("LIBRARIAN RESOLVE_AND_ASSEMBLE START — query_id=%s", query.query_id)
-            t0 = _time.monotonic()
-            try:
-                scope_request = ScopeRequest(
-                    query_id=query.query_id,
-                    query_text=query.query_text,
-                    router_decision=router_decision,
-                    traversal_config=self._config.get("traversal_config"),
-                )
-                lib_request = LibrarianRequest(
-                    request_type="RESOLVE_AND_ASSEMBLE",
-                    payload=scope_request,
-                )
-                lib_response = self._librarian.process(lib_request)
-            except Exception:
-                logger.exception("LIBRARIAN RESOLVE_AND_ASSEMBLE FAILED")
-                raise
-            elapsed = _time.monotonic() - t0
-
-            if not lib_response.success:
-                logger.error("LIBRARIAN ASSEMBLY returned errors: %s", lib_response.errors)
-                raise AssemblyError(
-                    f"Assembly failed: {lib_response.errors}"
-                )
-
-            logger.info("LIBRARIAN RESOLVE_AND_ASSEMBLE DONE — elapsed=%.2fs", elapsed)
-            total_elapsed = _time.monotonic() - pipeline_t0
-            logger.info("process_query DONE — total elapsed=%.2fs", total_elapsed)
-            return router_decision, lib_response.payload
-
-        total_elapsed = _time.monotonic() - pipeline_t0
-        logger.info("process_query DONE — no graph scope — total elapsed=%.2fs", total_elapsed)
-        return router_decision, None
 
 
 # ============================================================================
@@ -443,6 +220,62 @@ class OrchestratorV5:
         # Per-stage performance stashes (v5 evaluation)
         self._stage_timings: Dict[str, float] = {}
         self._stage_token_usage: Dict[str, Dict] = {}
+        
+        # Checkpoint path for saving librarian output
+        self._checkpoint_path = config.get("checkpoint_path", "librarian_checkpoint.json")
+
+    def save_librarian_checkpoint(self, librarian_output: Any, path: Optional[str] = None) -> str:
+        """Save the librarian output (graph) to a JSON checkpoint file.
+        
+        Parameters
+        ----------
+        librarian_output:
+            The LibrarianOutput to serialize.
+        path:
+            Optional path override. Defaults to self._checkpoint_path.
+            
+        Returns
+        -------
+        str
+            Path where checkpoint was saved.
+        """
+        save_path = path or self._checkpoint_path
+        
+        def _serialize(obj):
+            """Custom serializer for dataclasses and special types."""
+            if hasattr(obj, "__dataclass_fields__"):
+                return {k: _serialize(v) for k, v in vars(obj).items()}
+            elif isinstance(obj, dict):
+                return {str(k): _serialize(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [_serialize(v) for v in obj]
+            elif isinstance(obj, (str, int, float, bool, type(None))):
+                return obj
+            elif hasattr(obj, 'value'):  # Enums
+                return obj.value
+            else:
+                return str(obj)
+        
+        checkpoint = {
+            "timestamp": datetime.now().isoformat(),
+            "graph": {
+                "node_count": len(librarian_output.graph.nodes),
+                "edge_count": len(librarian_output.graph.edges),
+                "nodes": _serialize(librarian_output.graph.nodes),
+                "edges": _serialize(librarian_output.graph.edges),
+                "adjacency": librarian_output.graph.adjacency,
+                "node_by_doc": librarian_output.graph.node_by_doc,
+                "bridge_edges": librarian_output.graph.bridge_edges,
+            },
+            "community_structure": _serialize(librarian_output.community_structure) if librarian_output.community_structure else None,
+            "document_ids": list(librarian_output.document_store.keys()) if librarian_output.document_store else [],
+        }
+        
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, indent=2, default=str)
+        
+        logger.info("CHECKPOINT saved to %s", save_path)
+        return save_path
 
     def index_corpus_v5(self, documents: List[RawDocument]) -> LibrarianOutput:
         """Index a corpus through the v5 pipeline.
@@ -559,6 +392,10 @@ class OrchestratorV5:
         )
 
         self._index = librarian_output
+        
+        # Save checkpoint if enabled
+        if self._config.get("save_checkpoint", False):
+            self.save_librarian_checkpoint(librarian_output)
 
         total_elapsed = _time.monotonic() - pipeline_t0
         self._stage_timings["index_total"] = total_elapsed * 1000
@@ -989,89 +826,7 @@ class MockLLMClient:
 
     # -- Gleaning -------------------------------------------------------------
 
-    @staticmethod
-    def _handle_gleaning(prompt: str) -> str:
-        return json.dumps({
-            "additional_entities": [],
-            "additional_edges": [],
-            "corrections": [],
-            "confidence_complete": 1.0,
-        })
 
-    # -- Edge interpretation --------------------------------------------------
-
-    @staticmethod
-    def _handle_edge_interpretation(prompt: str) -> str:
-        return json.dumps({
-            "relevant_edges": [
-                {
-                    "edge_id": "edge_governs_1",
-                    "relevance_score": 0.95,
-                    "reasoning_hint": (
-                        "DORA regulatory requirements govern the MSA"
-                    ),
-                    "precedence_rule": (
-                        "DORA requirements are mandatory minimums; "
-                        "MSA can be stricter but not more permissive."
-                    ),
-                }
-            ],
-            "supporting_documents": [
-                {
-                    "doc_id": "DORA",
-                    "dependency_type": "REGULATION",
-                    "required_sections": None,
-                }
-            ],
-            "domain_pair": {
-                "primary_domain": "REGULATORY",
-                "secondary_domain": "LEGAL",
-                "cross_domain_logic": (
-                    "Regulatory floor supersedes contract"
-                ),
-            },
-            "completeness_confidence": 0.9,
-            "warnings": [],
-        })
-
-    # -- Decontextualization --------------------------------------------------
-
-    @staticmethod
-    def _handle_decontextualization(prompt: str) -> str:
-        if "MASTER SERVICE AGREEMENT" in prompt:
-            return json.dumps({
-                "decontextualized_content": (
-                    'MASTER SERVICE AGREEMENT\n\n'
-                    'Section 1. DEFINITIONS\n'
-                    '"Vendor" means Acme Corp.\n\n'
-                    'Section 2. LIMITATION OF LIABILITY\n'
-                    'The Vendor [defined as: Acme Corp] shall not be liable '
-                    'for any indirect, incidental, or consequential damages. '
-                    'The Vendor\'s total aggregate liability shall not exceed '
-                    '$1,000,000.'
-                ),
-                "substitutions_made": [
-                    {
-                        "term": "Vendor",
-                        "definition": "Acme Corp",
-                        "location": "Section 2",
-                    }
-                ],
-                "failures": [],
-                "final_token_count": 60,
-            })
-
-        # DORA or any other document: no Vendor term in content
-        return json.dumps({
-            "decontextualized_content": prompt.split("ORIGINAL TEXT:\n")[1].split(
-                "\n\nDEFINITIONS AVAILABLE:"
-            )[0] if "ORIGINAL TEXT:" in prompt else "",
-            "substitutions_made": [],
-            "failures": [
-                {"term": "Vendor", "reason": "NOT_FOUND"},
-            ],
-            "final_token_count": 50,
-        })
 
 
 # ============================================================================
@@ -1093,7 +848,7 @@ class MockLLMClientV5:
     def __init__(self):
         self.last_usage = None
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, **kwargs) -> str:
         # --- v5 EXPLORER prompts ---
         if "Extract all named entities" in prompt:
             result = self._handle_entity_extraction(prompt)
@@ -1124,6 +879,10 @@ class MockLLMClientV5:
             "total_tokens": prompt_tokens + completion_tokens,
         }
         return result
+
+    def batch_generate(self, prompts: List[str], **kwargs) -> List[str]:
+        """Mock batch generation by calling generate sequentially."""
+        return [self.generate(p, **kwargs) for p in prompts]
 
     @staticmethod
     def _handle_entity_extraction(prompt: str) -> str:

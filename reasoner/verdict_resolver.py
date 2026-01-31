@@ -18,26 +18,26 @@ from schemas.contracts import (
     VerdictType,
 )
 
-_SUPPORTING = {
+SUPPORTING = {
     EpistemicRelationship.SUPPORTS,
     EpistemicRelationship.STRONGLY_SUPPORTS,
     EpistemicRelationship.PARTIALLY_SUPPORTS,
-    EpistemicRelationship.EXTENDS,
 }
 
-_CONTRADICTING = {
+
+CONTRADICTING = {
     EpistemicRelationship.CONTRADICTS,
     EpistemicRelationship.STRONGLY_CONTRADICTS,
     EpistemicRelationship.PARTIALLY_CONTRADICTS,
     EpistemicRelationship.SUPERSEDES,
 }
 
-_STRONG_SUPPORT = {
+STRONG_SUPPORT = {
     EpistemicRelationship.SUPPORTS,
     EpistemicRelationship.STRONGLY_SUPPORTS,
 }
 
-_STRONG_CONTRADICT = {
+STRONG_CONTRADICT = {
     EpistemicRelationship.CONTRADICTS,
     EpistemicRelationship.STRONGLY_CONTRADICTS,
 }
@@ -51,8 +51,11 @@ _NEUTRAL = {
 def determine_verdict_type(
     relationships: List[InferredRelationship],
     evidence: List[GroundedEvidence],
+    threshold: float = 0.5,
 ) -> VerdictType:
     """Determine the verdict type from inferred relationships and evidence.
+
+    Uses Midpoint Thresholding (M(d,c) = 1 if z > t) as defined in ISSUES.md.
 
     Parameters
     ----------
@@ -60,6 +63,8 @@ def determine_verdict_type(
         Epistemic relationships extracted by the REASONER.
     evidence:
         Grounded evidence records.
+    threshold:
+        Decision threshold t (default 0.5).
 
     Returns
     -------
@@ -69,24 +74,28 @@ def determine_verdict_type(
     if not relationships and not evidence:
         return VerdictType.NOT_FOUND
 
-    supporting = sum(1 for r in relationships if r.relationship in _SUPPORTING)
-    contradicting = sum(1 for r in relationships if r.relationship in _CONTRADICTING)
-    strong_support = sum(1 for r in relationships if r.relationship in _STRONG_SUPPORT)
-    strong_contradict = sum(1 for r in relationships if r.relationship in _STRONG_CONTRADICT)
+    # Grounded counts using midpoint thresholding
+    supporting = sum(1 for r in relationships if r.relationship in SUPPORTING and r.z_score > threshold)
+    contradicting = sum(1 for r in relationships if r.relationship in CONTRADICTING and r.z_score > threshold)
+    
+    strong_support = sum(1 for r in relationships if r.relationship in STRONG_SUPPORT and r.z_score > threshold)
+    strong_contradict = sum(1 for r in relationships if r.relationship in STRONG_CONTRADICT and r.z_score > threshold)
 
-    # All neutral relationships
-    if relationships and all(r.relationship in _NEUTRAL for r in relationships):
+    # All neutral or below threshold
+    if relationships and supporting == 0 and contradicting == 0:
         return VerdictType.NOT_FOUND
 
     if contradicting > supporting and strong_contradict >= 2:
         return VerdictType.REFUTED
     if contradicting > supporting and strong_contradict < 2:
         return VerdictType.PARTIALLY_REFUTED
+    
     if supporting > contradicting and strong_support >= 2:
         # Strict Rule: CONFIRMED requires at least one exact quote (C)
         # linked to a structural relationship (A).
         has_linked_structural = any(
-            r.relationship in _STRONG_SUPPORT and
+            r.relationship in STRONG_SUPPORT and
+            r.z_score > threshold and
             r.evidence_quote and
             any(e.exact_quote == r.evidence_quote and e.source_chunk for e in evidence)
             for r in relationships
@@ -133,8 +142,8 @@ def calculate_confidence(
     # Source agreement: consistency of direction
     directional = [r for r in relationships if r.relationship not in _NEUTRAL]
     if directional:
-        sup = sum(1 for r in directional if r.relationship in _SUPPORTING)
-        con = sum(1 for r in directional if r.relationship in _CONTRADICTING)
+        sup = sum(1 for r in directional if r.relationship in SUPPORTING)
+        con = sum(1 for r in directional if r.relationship in CONTRADICTING)
         total = len(directional)
         source_agreement = max(sup, con) / total
     else:

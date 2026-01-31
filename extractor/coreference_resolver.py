@@ -58,7 +58,62 @@ def resolve_coreferences(
         if form not in grouped_forms:
             groups.append(CoreferenceGroup(canonical_form=form, variants=[form]))
 
+    # Post-LLM: add bridge groups for substring-overlapping canonicals
+    bridge_groups = find_partial_match_groups(groups)
+    groups.extend(bridge_groups)
+
     return groups
+
+
+def find_partial_match_groups(
+    groups: List[CoreferenceGroup],
+    min_token_length: int = 3,
+) -> List[CoreferenceGroup]:
+    """Identify substring-overlap relationships between coreference groups.
+
+    When one group's canonical form is a significant substring of another
+    (e.g., "Oxford" inside "University of Oxford"), create a bridge group
+    containing both canonical forms. These groups produce SYNONYMY edges
+    in the edge builder, connecting otherwise disjoint subgraphs.
+
+    Parameters
+    ----------
+    groups:
+        Existing coreference groups from LLM resolution.
+    min_token_length:
+        Minimum character length for a canonical form to be considered
+        as a substring candidate (avoids spurious matches on short tokens).
+
+    Returns
+    -------
+    List[CoreferenceGroup]
+        Additional bridge groups for substring-overlapping canonicals.
+    """
+    bridge_groups: List[CoreferenceGroup] = []
+    canonicals = [g.canonical_form for g in groups]
+    seen_pairs: set = set()
+
+    for i, shorter in enumerate(canonicals):
+        if len(shorter) < min_token_length:
+            continue
+        shorter_lower = shorter.lower()
+        for j, longer in enumerate(canonicals):
+            if i == j:
+                continue
+            if len(longer) <= len(shorter):
+                continue
+            pair = (min(i, j), max(i, j))
+            if pair in seen_pairs:
+                continue
+            if shorter_lower in longer.lower():
+                seen_pairs.add(pair)
+                # Create a bridge group linking the two canonicals
+                bridge_groups.append(CoreferenceGroup(
+                    canonical_form=longer,
+                    variants=[longer, shorter],
+                ))
+
+    return bridge_groups
 
 
 def _build_prompt(surface_forms: List[str]) -> str:

@@ -474,7 +474,12 @@ from schemas.contracts import (
 )
 
 from librarian.similarity_index import SimilarityIndex
-from librarian.edge_builder import extract_explicit_edges, create_synonymy_edges
+from librarian.edge_builder import (
+    extract_explicit_edges,
+    create_synonymy_edges,
+    boost_bridge_edges,
+    discount_synonymy_by_degree,
+)
 from librarian.graph_assembler import assemble_graph
 from librarian.community_detector import detect_communities
 from librarian.community_summarizer import summarize_communities
@@ -525,8 +530,19 @@ class LibrarianControllerV5:
             min_cross_doc_edges=min_cross_doc_edges,
         )
 
-        # 5. Combine edges and assemble graph
+        # 5. Combine edges, apply degree-discounting, boost bridges, assemble graph
         all_edges = explicit_edges + synonymy_edges
+
+        # P2b: Discount SYNONYMY edges by node degree to prevent similarity clusters
+        synonymy_discount = self._config.get("synonymy_degree_discount", True)
+        if synonymy_discount:
+            discount_synonymy_by_degree(all_edges, nodes_dict)
+
+        # P3: Boost bridge edge weights
+        bridge_multiplier = self._config.get("bridge_edge_multiplier", 1.5)
+        if bridge_multiplier != 1.0:
+            boost_bridge_edges(all_edges, multiplier=bridge_multiplier)
+
         graph = assemble_graph(nodes_dict, all_edges)
 
         # 6. Community detection

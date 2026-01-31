@@ -18,6 +18,7 @@ def extract_entities(
     llm_client,
     chunk: TextChunk,
     schema: Optional[Dict[str, Any]] = None,
+    num_ctx: Optional[int] = None,
 ) -> List[ExtractedEntity]:
     """Extract named entities from a text chunk.
 
@@ -29,6 +30,8 @@ def extract_entities(
         The text chunk to extract entities from.
     schema:
         Optional entity type schema to guide extraction.
+    num_ctx:
+        Optional context window size.
 
     Returns
     -------
@@ -36,7 +39,7 @@ def extract_entities(
         Extracted entities with types and positions.
     """
     prompt = _build_prompt(chunk, schema)
-    raw_response = llm_client.generate(prompt)
+    raw_response = llm_client.generate(prompt, num_ctx=num_ctx)
     return _parse_response(raw_response, chunk)
 
 
@@ -69,23 +72,25 @@ def _build_prompt(chunk: TextChunk, schema: Optional[Dict[str, Any]] = None) -> 
             type_guidance = f"Entity type definitions:\n{type_defs}"
 
     return (
-        "Extract all named entities from the following text.\n\n"
+        "Extract ALL named entities for a factual audit. Return ONLY a JSON array.\n"
+        "If no entities are found, return [].\n\n"
         f"{type_guidance}\n\n"
-        "Return a JSON array of objects, each with:\n"
-        '- "surface_form": the exact text of the entity mention\n'
-        '- "entity_type": the type category\n'
-        '- "description": a brief (1-2 sentence) context-grounded description '
-        "of what the entity is, drawn from the text\n\n"
+        "Return a JSON array with one object per entity:\n"
+        '  {"sf": "entity mention", "t": "entity type", "d": "1-sentence context"}\n\n'
         "EXAMPLE:\n"
-        'Text: "The Vendor, defined as Acme Corp, shall provide IT services."\n'
-        "Output:\n"
-        '[{"surface_form": "Vendor", "entity_type": "ACTOR", '
-        '"description": "The party providing services, defined as Acme Corp"}]\n\n'
-        "Return ONLY the JSON array.\n\n"
-        f"--- TEXT (chunk {chunk.chunk_id}) ---\n"
+        'Text: "John Smith (born 1982) founded Acme Corp in New York in 2005."\n'
+        'Output: [\n'
+        '  {"sf": "John Smith", "t": "PERSON", "d": "Founder born 1982"},\n'
+        '  {"sf": "Acme Corp", "t": "ORGANIZATION", "d": "Company founded in 2005"},\n'
+        '  {"sf": "New York", "t": "LOCATION", "d": "Location of founding"},\n'
+        '  {"sf": "1982", "t": "DATE", "d": "Birth year of John Smith"},\n'
+        '  {"sf": "2005", "t": "DATE", "d": "Year Acme Corp was founded"}\n'
+        ']\n\n'
+        f"--- TEXT ({chunk.chunk_id}) ---\n"
         f"{chunk.text}\n"
-        "--- END TEXT ---"
     )
+
+
 
 
 def _parse_response(raw: str, chunk: TextChunk) -> List[ExtractedEntity]:
@@ -101,14 +106,15 @@ def _parse_response(raw: str, chunk: TextChunk) -> List[ExtractedEntity]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        surface_form = safe_str(item.get("surface_form")).strip()
+        # Handle both abbreviated (sf, t, d) and full key names
+        surface_form = safe_str(item.get("surface_form") or item.get("sf")).strip()
         if not surface_form or surface_form in seen:
             continue
         seen.add(surface_form)
 
-        entity_type = safe_str(item.get("entity_type"), "UNKNOWN").strip()
+        entity_type = safe_str(item.get("entity_type") or item.get("t"), "UNKNOWN").strip()
         char_offset = chunk.text.find(surface_form)
-        raw_desc = safe_str(item.get("description")).strip() or None
+        raw_desc = safe_str(item.get("description") or item.get("d")).strip() or None
         entities.append(
             ExtractedEntity(
                 surface_form=surface_form,
@@ -120,6 +126,7 @@ def _parse_response(raw: str, chunk: TextChunk) -> List[ExtractedEntity]:
         )
 
     return entities
+
 
 
 def _parse_line_format(raw: str, chunk: TextChunk) -> List[ExtractedEntity]:

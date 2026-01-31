@@ -4,18 +4,18 @@ Location: librarian/assembler/context_builder.py
 Owner: LIBRARIAN Instance
 
 Responsibility: Assemble the final LCI payload for downstream reasoning.
-Handles document ordering (definitions before usage, regulations before
-contracts, amendments last), edge grammar generation, and token budget
-management.
+Enforces graph-aware pruning (2-hop limit) and token budget management.
 """
 
 from __future__ import annotations
-
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from schemas.contracts import (
+    AliasedDocument,
+    AliasMap,
     DependencyType,
     DocumentRole,
     DomainPair,
@@ -30,6 +30,9 @@ from schemas.contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
 
 
 # ============================================================================
@@ -50,198 +53,8 @@ class ContextBuildOutput:
     """Output of the context builder."""
     lci_payload: LCIPayload
     assembly_warnings: List[str]
+    alias_map: Optional[AliasMap] = None  # For post-inference metadata join
 
-
-# ============================================================================
-# TOKEN ESTIMATION
-# ============================================================================
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 characters per token for English text."""
-    return max(1, len(text) // 4)
-
-
-# ============================================================================
-# DOCUMENT ORDERING
-# ============================================================================
-
-def order_documents(scope: ScopeObject) -> List[str]:
-    """Order documents for optimal LCI injection.
-
-    Priority
-    --------
-    1. Definition documents (``DEFINES_TERM`` edges) — must come first
-    2. Regulatory documents (``GOVERNS`` edges) — establish floor
-    3. Primary source documents
-    4. Primary target documents
-    5. Amendment documents (``AMENDS`` edges) — apply last
-    """
-    ordered: List[str] = []
-    seen: Set[str] = set()
-
-    def _add(doc_id: str) -> None:
-        if doc_id not in seen:
-            ordered.append(doc_id)
-            seen.add(doc_id)
-
-    # 1. Definitions first
-    for doc in scope.supporting_documents:
-        if doc.dependency_type == DependencyType.DEFINITION:
-            _add(doc.doc_id)
-
-    # 2. Regulations second
-    for doc in scope.supporting_documents:
-        if doc.dependency_type == DependencyType.REGULATION:
-            _add(doc.doc_id)
-
-    # 3. Primary source and target documents
-    for doc in scope.primary_documents:
-        if doc.role in (DocumentRole.SOURCE, DocumentRole.TARGET):
-            _add(doc.doc_id)
-
-    # 4. Context documents
-    for doc in scope.primary_documents:
-        if doc.role == DocumentRole.CONTEXT:
-            _add(doc.doc_id)
-
-    # 5. Amendments last
-    for doc in scope.supporting_documents:
-        if doc.dependency_type == DependencyType.AMENDMENT:
-            _add(doc.doc_id)
-
-    # 6. Any remaining supporting docs (REFERENCE, etc.)
-    for doc in scope.supporting_documents:
-        _add(doc.doc_id)
-
-    return ordered
-
-
-# ============================================================================
-# EDGE GRAMMAR GENERATION
-# ============================================================================
-
-def generate_edge_grammar(edge_context: List[EdgeContext]) -> str:
-    """Generate a natural language preamble explaining edge semantics.
-
-    The resulting text is injected ahead of the documents in the LCI
-    payload so the downstream model understands the structural
-    relationships before it reads the content.
-    """
-    # DEBUG [Request #2]: Confirm generate_edge_grammar() is being called
-    print(f"\n[DEBUG] generate_edge_grammar() called")
-    # DEBUG [Request #3]: Print edge_context list before grammar generation
-    print(f"[DEBUG] edge_context has {len(edge_context)} entries:")
-    for ec in edge_context:
-        print(f"  {ec.edge_id}: {ec.source_doc} --{ec.edge_type.value}--> {ec.target_doc}"
-              f"  hint={ec.reasoning_hint!r}")
-    if not edge_context:
-        print("[DEBUG] edge_context is EMPTY — returning empty grammar")
-        return ""
-
-    grammar_lines: List[str] = [
-        "DOCUMENT RELATIONSHIP RULES:",
-        "When analyzing these documents, apply the following logic:",
-        "",
-    ]
-
-    for edge in edge_context:
-        if edge.edge_type == EdgeType.GOVERNS:
-            grammar_lines.append(
-                f"- {edge.source_doc} GOVERNS {edge.target_doc}: "
-                f"Regulatory requirements set a floor. {edge.target_doc} can be "
-                f"stricter but not more permissive."
-            )
-        elif edge.edge_type == EdgeType.AMENDS:
-            grammar_lines.append(
-                f"- {edge.source_doc} AMENDS {edge.target_doc}: "
-                f"Where they conflict, {edge.source_doc} supersedes."
-            )
-        elif edge.edge_type == EdgeType.DEFINES_TERM:
-            grammar_lines.append(
-                f"- {edge.source_doc} DEFINES terms used in {edge.target_doc}: "
-                f"Interpret terms according to their defined meanings."
-            )
-        elif edge.edge_type == EdgeType.INCORPORATES:
-            grammar_lines.append(
-                f"- {edge.source_doc} INCORPORATES {edge.target_doc}: "
-                f"The referenced document is legally part of the primary document."
-            )
-        elif edge.edge_type == EdgeType.CROSS_REFERENCES:
-            grammar_lines.append(
-                f"- {edge.source_doc} CROSS-REFERENCES {edge.target_doc}: "
-                f"Explicit citation exists between these documents."
-            )
-        elif edge.edge_type == EdgeType.SAME_TRANSACTION:
-            grammar_lines.append(
-                f"- {edge.source_doc} and {edge.target_doc} are part of the "
-                f"SAME TRANSACTION: Interpret them as a unified agreement."
-            )
-        elif edge.edge_type == EdgeType.TEMPORAL_SEQUENCE:
-            grammar_lines.append(
-                f"- {edge.source_doc} precedes {edge.target_doc} in "
-                f"TEMPORAL SEQUENCE: Check for implicit supersession."
-            )
-        elif edge.edge_type == EdgeType.CONTAINS:
-            # Structural parent→child edge — enables graph traversal only,
-            # no reasoning hint needed in the LCI preamble.
-            continue
-
-        # Append precedence rule if present
-        if edge.precedence_rule:
-            grammar_lines.append(f"  Precedence: {edge.precedence_rule}")
-
-    grammar_lines.append("")
-    grammar_lines.append(
-        "Apply these rules when identifying contradictions or conflicts."
-    )
-
-    return "\n".join(grammar_lines)
-
-
-# ============================================================================
-# DOMAIN LOGIC GENERATION
-# ============================================================================
-
-def generate_domain_logic(domain_pair: DomainPair) -> str:
-    """Generate domain-specific reasoning instructions for the preamble."""
-    lines: List[str] = ["DOMAIN CONTEXT:"]
-
-    primary = domain_pair.primary_domain
-    secondary = domain_pair.secondary_domain
-
-    domain_descriptions = {
-        DomainType.LEGAL: "These are legal documents (contracts, agreements). "
-                          "Apply contractual interpretation principles.",
-        DomainType.REGULATORY: "These are regulatory documents. "
-                               "Compliance requirements are mandatory minimums.",
-        DomainType.SCIENTIFIC: "These are scientific/technical documents. "
-                               "Focus on methodological accuracy.",
-        DomainType.FINANCIAL: "These are financial documents. "
-                              "Numerical precision is critical.",
-        DomainType.CROSS_DOMAIN: "These documents span multiple domains. "
-                                  "Apply the stricter standard where domains conflict.",
-    }
-
-    lines.append(domain_descriptions.get(
-        primary,
-        f"Primary domain: {primary.value}.",
-    ))
-
-    if secondary and secondary != primary:
-        lines.append(
-            f"Secondary domain: {secondary.value}. "
-            f"Cross-domain analysis required."
-        )
-
-    if domain_pair.cross_domain_logic:
-        lines.append(f"Cross-domain rule: {domain_pair.cross_domain_logic}")
-
-    return "\n".join(lines)
-
-
-# ============================================================================
-# PRECEDENCE RULES EXTRACTION
-# ============================================================================
 
 def extract_precedence_rules(edge_context: List[EdgeContext]) -> List[str]:
     """Collect all non-null precedence rules from edge context."""
@@ -251,124 +64,223 @@ def extract_precedence_rules(edge_context: List[EdgeContext]) -> List[str]:
         if edge.precedence_rule
     ]
 
+# ============================================================================
+# GRAPH-AWARE PRUNING
+# ============================================================================
+
+def get_reachable_docs(scope: ScopeObject, max_hops: int = 2) -> Set[str]:
+    """Identify documents within N hops of primary audit targets."""
+    # Start with primary targets and sources
+    reachable = {d.doc_id for d in scope.primary_documents}
+    current_layer = set(reachable)
+
+    for i in range(max_hops):
+        next_layer = set()
+        for edge in scope.edge_context:
+            if edge.source_doc in current_layer and edge.target_doc not in reachable:
+                next_layer.add(edge.target_doc)
+            elif edge.target_doc in current_layer and edge.source_doc not in reachable:
+                next_layer.add(edge.source_doc)
+        
+        if not next_layer:
+            break
+        reachable.update(next_layer)
+        current_layer = next_layer
+        
+    return reachable
+
+# ============================================================================
+# DOCUMENT ORDERING
+# ============================================================================
+
+def order_documents(scope: ScopeObject, allowed_ids: Set[str]) -> List[str]:
+    """Order reachable documents for optimal LCI injection."""
+    ordered: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(doc_id: str) -> None:
+        if doc_id in allowed_ids and doc_id not in seen:
+            ordered.append(doc_id)
+            seen.add(doc_id)
+
+    # 1. Definitions/Foundational docs first
+    for doc in scope.supporting_documents:
+        if doc.dependency_type == DependencyType.DEFINITION:
+            _add(doc.doc_id)
+
+    # 2. Governing/Policy docs second
+    for doc in scope.supporting_documents:
+        if doc.dependency_type == DependencyType.REGULATION:
+            _add(doc.doc_id)
+
+    # 3. Primary targets
+    for doc in scope.primary_documents:
+        if doc.role in (DocumentRole.SOURCE, DocumentRole.TARGET):
+            _add(doc.doc_id)
+
+    # 4. Contextual evidence
+    for doc in scope.primary_documents:
+        if doc.role == DocumentRole.CONTEXT:
+            _add(doc.doc_id)
+
+    # 5. General References
+    for doc in scope.supporting_documents:
+        if doc.dependency_type == DependencyType.REFERENCE:
+            _add(doc.doc_id)
+
+    # 6. Updates/Amendments last
+    for doc in scope.supporting_documents:
+        if doc.dependency_type == DependencyType.AMENDMENT:
+            _add(doc.doc_id)
+
+    return ordered
+
+# ============================================================================
+# NEUTRAL EDGE GRAMMAR
+# ============================================================================
+
+def generate_edge_grammar(edge_context: List[EdgeContext]) -> str:
+    """Explains structural relationships using neutral auditing terms."""
+    if not edge_context:
+        return ""
+
+    grammar_lines: List[str] = [
+        "DOCUMENT RELATIONSHIP RULES:",
+        "Apply the following structural logic during synthesis:",
+        "",
+    ]
+
+    for edge in edge_context:
+        if edge.edge_type == EdgeType.GOVERNS:
+            grammar_lines.append(
+                f"- {edge.source_doc} GOVERNS {edge.target_doc}: "
+                f"{edge.source_doc} establishes the baseline requirements."
+            )
+        elif edge.edge_type == EdgeType.AMENDS:
+            grammar_lines.append(
+                f"- {edge.source_doc} AMENDS {edge.target_doc}: "
+                f"Where they conflict, the information in {edge.source_doc} is the most recent."
+            )
+        elif edge.edge_type == EdgeType.DEFINES_TERM:
+            grammar_lines.append(
+                f"- {edge.source_doc} DEFINES terms used in {edge.target_doc}: "
+                f"Interpret terms according to their specific definitions in {edge.source_doc}."
+            )
+        elif edge.edge_type == EdgeType.INCORPORATES:
+            grammar_lines.append(
+                f"- {edge.source_doc} INCORPORATES {edge.target_doc}: "
+                f"The referenced document is formally part of the primary record."
+            )
+        elif edge.edge_type == EdgeType.TEMPORAL_SEQUENCE:
+            grammar_lines.append(
+                f"- {edge.source_doc} precedes {edge.target_doc} in "
+                f"TEMPORAL SEQUENCE: Use this to establish chronology."
+            )
+
+    grammar_lines.append("\nResolve contradictions based on these structural rules.")
+    return "\n".join(grammar_lines)
 
 # ============================================================================
 # CONTEXT BUILDER
 # ============================================================================
 
 class ContextBuilder:
-    """Assemble the final LCI payload from resolved scope and documents.
-
-    Parameters
-    ----------
-    config:
-        Optional dictionary with keys:
-        - ``max_context_tokens`` (int, default 200_000)
-        - ``include_edge_preamble`` (bool, default True)
-    """
-
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self._config = config or {}
         self._default_max_tokens = self._config.get("max_context_tokens", 200_000)
-        self._include_preamble = self._config.get("include_edge_preamble", True)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._max_hops = self._config.get("max_graph_hops", 2)
+        self._max_top_k = self._config.get("max_top_k")  # v5
 
     def build(self, inp: ContextBuildInput) -> ContextBuildOutput:
-        """Build the LCI payload.
-
-        Flow
-        ----
-        1. Generate preamble (edge grammar + domain logic)
-        2. Order documents according to dependency priority
-        3. Assemble ``OrderedDocument`` list within token budget
-        4. Return ``LCIPayload`` and any warnings
-        """
         scope = inp.scope_object
         max_tokens = inp.max_context_tokens or self._default_max_tokens
         warnings: List[str] = []
 
-        # --- 1. Preamble ---
-        if self._include_preamble:
-            edge_grammar = generate_edge_grammar(scope.edge_context)
-            domain_logic = generate_domain_logic(scope.domain_pair)
-            precedence_rules = extract_precedence_rules(scope.edge_context)
-        else:
-            edge_grammar = ""
-            domain_logic = ""
-            precedence_rules = []
-
+        # 1. Pruning: Only keep docs within 2 hops of the query targets
+        reachable_ids = get_reachable_docs(scope, max_hops=self._max_hops)
+        
+        # 2. Preamble (Neutral)
+        edge_grammar = generate_edge_grammar(scope.edge_context)
         preamble = LCIPreamble(
             edge_grammar=edge_grammar,
-            domain_logic=domain_logic,
-            precedence_rules=precedence_rules,
+            domain_logic="", # Simplified for general auditing
+            precedence_rules=extract_precedence_rules(scope.edge_context),
         )
-        preamble_tokens = _estimate_tokens(edge_grammar + domain_logic)
+        preamble_tokens = _estimate_tokens(edge_grammar)
 
-        # --- 2. Order documents ---
-        ordered_ids = order_documents(scope)
+        # 3. Rank-based Pruning (Top-K)
+        all_candidates: List[Tuple[str, float]] = []
+        for d in scope.primary_documents:
+            all_candidates.append((d.doc_id, d.relevance_score))
+        for d in scope.supporting_documents:
+            all_candidates.append((d.doc_id, d.relevance_score))
 
-        # Build lookup: doc_id -> content (prefer decontextualized)
-        raw_lookup: Dict[str, str] = {d.doc_id: d.content for d in inp.raw_documents}
-        content_lookup: Dict[str, str] = {}
-        for doc_id in ordered_ids:
-            content_lookup[doc_id] = inp.decontextualized_contents.get(
-                doc_id, raw_lookup.get(doc_id, "")
-            )
+        # Filter by reachability
+        filtered_candidates = [
+            (doc_id, score) for doc_id, score in all_candidates
+            if doc_id in reachable_ids
+        ]
 
-        # Build role lookup from scope
-        role_lookup: Dict[str, str] = {}
-        for doc in scope.primary_documents:
-            role_lookup[doc.doc_id] = doc.role.value
-        for doc in scope.supporting_documents:
-            if doc.doc_id not in role_lookup:
-                role_lookup[doc.doc_id] = doc.dependency_type.value
+        # Sort by score descending
+        filtered_candidates.sort(key=lambda x: x[1], reverse=True)
 
-        # --- 3. Assemble within token budget ---
+        # Apply Top-K ceiling
+        max_k = self._max_top_k
+        if max_k is not None and len(filtered_candidates) > max_k:
+            warnings.append(f"Top-K ceiling applied: kept {max_k} of {len(filtered_candidates)} docs")
+            filtered_candidates = filtered_candidates[:max_k]
+
+        allowed_ids = {doc_id for doc_id, _ in filtered_candidates}
+
+        # 4. Order documents for optimal Injection
+        ordered_ids = order_documents(scope, allowed_ids)
+
+        # 5. Assembly with UID generation and alias mapping
         documents: List[OrderedDocument] = []
+        alias_mappings: Dict[str, AliasedDocument] = {}
         running_tokens = preamble_tokens
-        injection_order = 0
-
+        
         for doc_id in ordered_ids:
-            content = content_lookup.get(doc_id)
-            if content is None:
-                warnings.append(f"Document {doc_id} not found in raw documents; skipped")
-                continue
+            content = inp.decontextualized_contents.get(doc_id)
+            if not content: continue
 
             doc_tokens = _estimate_tokens(content)
-
             if running_tokens + doc_tokens > max_tokens:
-                warnings.append(
-                    f"Document {doc_id} excluded: would exceed token budget "
-                    f"({running_tokens + doc_tokens} > {max_tokens})"
-                )
-                continue
+                warnings.append(f"Token limit reached at {doc_id}")
+                break
 
-            documents.append(
-                OrderedDocument(
-                    doc_id=doc_id,
-                    role=role_lookup.get(doc_id, "CONTEXT"),
-                    content=content,
-                    injection_order=injection_order,
-                )
+            # Generate immutable UID and alias
+            doc_uid = uuid.uuid4().hex
+            alias = f"[D{len(documents) + 1}]"
+
+            # Resolve role
+            role_map = {d.doc_id: d.role.value for d in scope.primary_documents}
+            role = role_map.get(doc_id, "CONTEXT")
+
+            documents.append(OrderedDocument(
+                doc_id=doc_id,
+                role=role,
+                content=content,
+                injection_order=len(documents),
+                uid=doc_uid,
+            ))
+            
+            # Build alias mapping for post-inference join
+            raw_doc = next((d for d in inp.raw_documents if d.doc_id == doc_id), None)
+            source_url = raw_doc.metadata.get("source_url") if raw_doc else None
+            alias_mappings[alias] = AliasedDocument(
+                alias=alias,
+                uid=doc_uid,
+                doc_id=doc_id,
+                chunk_id=None,  # Document-level, not chunk
+                source_url=source_url,
             )
             running_tokens += doc_tokens
-            injection_order += 1
 
-        lci_payload = LCIPayload(
-            preamble=preamble,
-            documents=documents,
-            total_tokens=running_tokens,
-        )
-
-        logger.info(
-            "Context built: %d documents, %d tokens (budget %d), %d warnings",
-            len(documents), running_tokens, max_tokens, len(warnings),
-        )
+        alias_map = AliasMap(mappings=alias_mappings) if alias_mappings else None
 
         return ContextBuildOutput(
-            lci_payload=lci_payload,
+            lci_payload=LCIPayload(preamble=preamble, documents=documents, total_tokens=running_tokens),
             assembly_warnings=warnings,
+            alias_map=alias_map,
         )

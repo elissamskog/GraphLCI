@@ -81,14 +81,26 @@ def parse_json_list(raw: str) -> list:
     1. Direct ``json.loads``
     2. Extract content from markdown ```json ... ``` fences
     3. Extract the first top-level ``[...]`` block via bracket matching
+    
+    If the result is a single dict object, wraps it in a list.
+    If the result is a dict with a list-valued field (e.g., {"entities": [...]}), extracts that list.
     """
     # Strategy 1: direct parse
     try:
         result = json.loads(raw)
         if isinstance(result, list):
             return result
+        if isinstance(result, dict):
+            # Check if dict contains a list (e.g., {"entities": [...]})
+            for key, value in result.items():
+                if isinstance(value, list):
+                    return value
+            # No list found — wrap the single object
+            return [result]
     except (json.JSONDecodeError, TypeError):
         pass
+
+
 
     # Strategy 2: markdown fence extraction
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw, re.DOTALL)
@@ -97,6 +109,8 @@ def parse_json_list(raw: str) -> list:
             result = json.loads(fence_match.group(1))
             if isinstance(result, list):
                 return result
+            if isinstance(result, dict):
+                return [result]
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -117,4 +131,22 @@ def parse_json_list(raw: str) -> list:
                     except (json.JSONDecodeError, TypeError):
                         break
 
+    # Strategy 4: brace matching for single object — wrap in list
+    start = raw.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(raw)):
+            if raw[i] == "{":
+                depth += 1
+            elif raw[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(raw[start : i + 1])
+                        if isinstance(result, dict):
+                            return [result]
+                    except (json.JSONDecodeError, TypeError):
+                        break
+
     raise ValueError(f"Could not parse JSON array from LLM response: {raw[:200]}")
+

@@ -503,11 +503,13 @@ class ScopeResolver:
         max_supporting = self._config.get("max_supporting_documents", 5)
         supporting_documents: List[SupportingDocument] = []
         for sd in interpretation.get("supporting_documents", [])[:max_supporting]:
+            doc_id = sd["doc_id"]
             supporting_documents.append(
                 SupportingDocument(
-                    doc_id=sd["doc_id"],
+                    doc_id=doc_id,
                     dependency_type=_safe_dependency_type(sd.get("dependency_type", "REFERENCE")),
                     required_sections=sd.get("required_sections"),
+                    relevance_score=score_map.get(doc_id, 0.0),
                 )
             )
 

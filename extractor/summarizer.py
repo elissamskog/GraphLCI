@@ -75,15 +75,13 @@ class Summarizer:
     @staticmethod
     def _build_prompt(doc: RawDocument) -> str:
         return (
-            "You are a legal-document analyst. Analyze the following document "
+            "You are an analytical auditing expert. Analyze the following document "
             "and return a JSON object with exactly these keys:\n"
             '- "summary": a 2-3 sentence summary of the document\n'
             '- "key_themes": a list of 3-5 key themes\n'
-            '- "apparent_domain": a specific domain label (e.g. '
-            '"corporate law", "environmental regulation")\n'
+            '- "apparent_domain": a specific domain label\n'
             '- "key_terms": a list of important terms or definitions found\n'
-            '- "document_type": one of: contract, regulation, protocol, '
-            "statute, policy, memorandum, agreement, amendment, or other\n\n"
+            '- "document_type": article, book, journal, report, whitepaper, or other\n\n'
             "Return ONLY the JSON object, no additional text.\n\n"
             f"--- DOCUMENT ID: {doc.doc_id} ---\n"
             f"{doc.content}\n"

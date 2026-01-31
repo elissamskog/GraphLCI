@@ -30,8 +30,29 @@ from schemas.contracts import (
     SciFactVerdict,
 )
 
+import yaml
+
 _logger = logging.getLogger(__name__)
-_DATA_DIR = os.path.join(_PROJECT_ROOT, "data", "raw", "scifact")
+
+def _get_configured_path():
+    config_path = os.path.join(_PROJECT_ROOT, "config.yaml")
+    default_path = os.path.join(_PROJECT_ROOT, "data", "raw", "scifact", "data")
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            if config and 'data' in config and 'scifact_path' in config['data']:
+                configured = config['data']['scifact_path']
+                if os.path.exists(configured):
+                    return configured
+                _logger.warning(f"Configured SciFact path not found: {configured}")
+        except Exception as e:
+            _logger.warning(f"Failed to read config.yaml: {e}")
+            
+    return default_path
+
+_DATA_DIR = _get_configured_path()
 
 
 def _load_corpus_jsonl(path: str) -> Dict[str, dict]:
@@ -54,6 +75,16 @@ def _load_claims_jsonl(path: str) -> Dict[str, list]:
             split = row.pop("split", "validation")
             by_split.setdefault(split, []).append(row)
     return by_split
+
+
+def _load_claims_jsonl_flat(path: str) -> list:
+    """Load claims from a local JSONL file into a flat list (no split field)."""
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            rows.append(row)
+    return rows
 
 
 def _load_from_huggingface() -> Tuple[Dict[str, dict], Dict[str, list]]:
@@ -103,11 +134,17 @@ class SciFactLoader:
 
     def __init__(self) -> None:
         corpus_path = os.path.join(_DATA_DIR, "corpus.jsonl")
-        claims_path = os.path.join(_DATA_DIR, "claims.jsonl")
+        # Try split-based file format first (claims_dev.jsonl), then combined format
+        claims_dev_path = os.path.join(_DATA_DIR, "claims_dev.jsonl")
+        claims_combined_path = os.path.join(_DATA_DIR, "claims.jsonl")
 
-        if os.path.exists(corpus_path) and os.path.exists(claims_path):
+        if os.path.exists(corpus_path) and os.path.exists(claims_dev_path):
             self._corpus_by_id = _load_corpus_jsonl(corpus_path)
-            self._claims_rows = _load_claims_jsonl(claims_path)
+            # Load claims_dev.jsonl as validation split (this is the labeled dev set)
+            self._claims_rows = {"validation": _load_claims_jsonl_flat(claims_dev_path)}
+        elif os.path.exists(corpus_path) and os.path.exists(claims_combined_path):
+            self._corpus_by_id = _load_corpus_jsonl(corpus_path)
+            self._claims_rows = _load_claims_jsonl(claims_combined_path)
         else:
             _logger.warning(
                 "Local SciFact data not found in %s. "
@@ -166,11 +203,15 @@ class SciFactLoader:
                             set(expected_evidence[doc_id_str])
                         )
 
+            # Convert cited_doc_ids to strings
+            cited_doc_id_strs = [str(doc_id) for doc_id in cited_doc_ids]
+
             cases.append(SciFactTestCase(
                 claim_id=claim_id,
                 claim_text=claim_text,
                 expected_verdict=verdict,
                 expected_evidence=expected_evidence,
+                cited_doc_ids=cited_doc_id_strs,
             ))
 
             if limit and len(cases) >= limit:

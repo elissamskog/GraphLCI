@@ -81,29 +81,30 @@ class LLMClient(Protocol):
 # ============================================================================
 
 INITIAL_EXTRACTION_PROMPT = """\
-You are a legal document analyst extracting structured information.
+You are an analytical auditing engine extracting structured evidence from documents.
 
 DOCUMENT ID: {doc_id}
 DOCUMENT CONTENT:
 {content}
 {corpus_context_section}
 {document_analysis_section}
+
 TASK: Extract entities and relationships following this taxonomy.
 
 NODE TYPES:
-- DOCUMENT: The document itself
-- ENTITY: Parties, organizations, roles (e.g., "Vendor", "Customer")
-- DEFINITION: Defined terms (e.g., "Affiliate means...")
-- CLAUSE: Specific provisions (e.g., "Limitation of Liability")
+- DOCUMENT: The source material being audited.
+- ENTITY: Subjects, organizations, persons, or specific objects (e.g., "Arthur's Magazine", "FIFA").
+- DEFINITION: Specific meanings assigned to terms or concepts within the text.
+- CLAIM: Specific assertions, factual statements, or findings (e.g., "Founded in 1844").
 
 EDGE TYPES:
-- AMENDS: This document modifies another
-- GOVERNS: A regulation applies to this document
-- DEFINES_TERM: A definition for a term used elsewhere
-- INCORPORATES: This document includes another by reference
-- CROSS_REFERENCES: Explicit citation to another section/document
-- SAME_TRANSACTION: Part of the same deal/agreement
-- TEMPORAL_SEQUENCE: Version ordering
+- AMENDS: This document updates, corrects, or changes information in another.
+- GOVERNS: A policy, rule, or higher-order document applies to this one.
+- DEFINES_TERM: A definition for a term or concept used elsewhere in the corpus.
+- INCORPORATES: This document includes content from another by reference.
+- CROSS_REFERENCES: An explicit citation or link to another document/section.
+- SAME_TRANSACTION: Related documents belonging to the same event or logical group.
+- TEMPORAL_SEQUENCE: Establishes a chronological order (e.g., versioning or event history).
 
 {domain_classification_section}
 
@@ -121,23 +122,23 @@ Respond in JSON:
   "definitions": [
     {{"node_id": "...", "term": "...", "definition_text": "..."}}
   ],
-  "clauses": [
-    {{"node_id": "...", "clause_type": "...", "content_summary": "..."}}
+  "claims": [
+    {{"node_id": "...", "claim_type": "...", "content_summary": "..."}}
   ],
   "edges": [
     {{
       "edge_id": "...",
       "source_node": "...",
       "target_node": "...",
-      "edge_type": "AMENDS | GOVERNS | ...",
+      "edge_type": "AMENDS | GOVERNS | DEFINES_TERM | INCORPORATES | CROSS_REFERENCES | SAME_TRANSACTION | TEMPORAL_SEQUENCE",
       "confidence": 0.0-1.0,
-      "reasoning_hint": "Doc B supersedes Section 4.2 of Doc A"
+      "reasoning_hint": "Chronological link: Doc B provides the founding date for Entity A mentioned in Doc A."
     }}
   ]
 }}"""
 
 GLEANING_PROMPT = """\
-You previously extracted entities and relationships from this document.
+You previously extracted entities and claims from this document.
 
 DOCUMENT CONTENT:
 {content}
@@ -145,18 +146,19 @@ DOCUMENT CONTENT:
 YOUR PREVIOUS EXTRACTION:
 {previous_extraction}
 
-TASK: Review your extraction for missed entities or relationships.
+TASK: Review your extraction for missed entities, claims, or relationships.
 
 Common misses:
-1. Implicit parties (pronouns like "the parties" referring to specific entities)
-2. Cross-references to external documents not explicitly named
-3. Defined terms used but not extracted
-4. Amendment or supersession relationships
-5. Regulatory references (e.g., "pursuant to GDPR")
+1. Implicit subjects (pronouns or titles referring to previously mentioned entities).
+2. Indirect references to external sources or documents.
+3. Defined concepts used in the text but not captured as definitions.
+4. Temporal links or versioning dependencies between facts.
+5. Structural relationships (e.g., one statement providing the basis for another).
 
 Respond in JSON:
 {{
   "additional_entities": [...],
+  "additional_claims": [...],
   "additional_edges": [...],
   "corrections": [
     {{"original": "...", "corrected": "...", "reason": "..."}}

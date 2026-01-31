@@ -44,9 +44,9 @@ class ExtractionOutput:
 # ============================================================================
 
 TARGET_EXTRACTION_PROMPT = """\
-You are a target extractor for a legal document audit system.
+You are a target extractor for an intelligent retrieval system.
 
-TASK: Identify which documents and entities the user is asking about.
+TASK: Identify which documents, entities, and search terms the user is asking about.
 
 AVAILABLE DOCUMENTS IN CORPUS:
 {available_documents}
@@ -56,14 +56,27 @@ KNOWN ENTITIES (parties, terms, clauses):
 
 QUERY: {query_text}
 
-Extract:
-1. EXPLICIT DOCUMENTS: Documents directly named or clearly referenced
-2. IMPLICIT ENTITIES: Concepts, parties, or terms that imply specific documents
+6. EXAMPLES:
+   Query: "What is the capital of France?" -> {{ "explicit_docs": [], "implicit_entities": ["France", "capital"], "ambiguities": [], "confidence": 1.0 }}
+   Query: "Who is the CEO of Acme Corp?" -> {{ "explicit_docs": [], "implicit_entities": ["CEO", "Acme Corp", "CEO of Acme Corp"], "ambiguities": [], "confidence": 1.0 }}
+   Query: "Does the MSA override the SOW?" -> {{ "explicit_docs": ["MSA", "SOW"], "implicit_entities": [], "ambiguities": [], "confidence": 1.0 }}
+
+INSTRUCTIONS:
+1. EXPLICIT DOCUMENTS: Identify documents directly named or clearly referenced.
+2. IMPLICIT ENTITIES & RELATIONAL CONCEPTS: Extract specific parties, functional roles, or relational terms.
+   - Capture POSSESSIVE forms (e.g., "The Vendor's liability" -> "Vendor's liability")
+   - Capture RELATIONAL phrases (e.g., "The author of the report" -> "author of the report")
+   - Identify basic entities (People, Organizations, Locations)
+3. RECOGNITION & NORMALIZATION: If the query contains QUANTITIES, DATES, or STATISTICS:
+   - Extract the value.
+   - Generate NORMALIZED FORMS (e.g., convert "twenty-five" to "25").
+   - Generate EQUIVALENT UNITS (e.g., convert "1/2000" to "0.05%" and "500 per million").
+   - Include these as "implicit_entities" to aid semantic search.
 
 Respond in JSON format:
 {{
-  "explicit_docs": ["doc_id_1", "doc_id_2"],
-  "implicit_entities": ["Liability Cap", "Vendor obligations"],
+  "explicit_docs": ["doc_id_1"],
+  "implicit_entities": ["Liability Cap", "1/2000", "500 per million", "0.05%"],
   "ambiguities": ["'the contract' could refer to MSA or SOW"],
   "confidence": 0.0-1.0
 }}"""

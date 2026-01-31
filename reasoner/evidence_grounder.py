@@ -24,6 +24,15 @@ def _normalize(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
 
+def _clean_quote(text: str) -> str:
+    """Remove citation tags and normalize whitespace/punctuation."""
+    # Remove [D1], [C12], [D1, D2] etc.
+    text = re.sub(r'\[[DCdc][\d,\s]+\]', '', text)
+    # Remove trailing punctuation
+    text = re.sub(r'[.,;:]+$', '', text.strip())
+    return _normalize(text)
+
+
 def find_quote_in_documents(
     quote: str,
     documents: Dict[str, RawDocument],
@@ -45,14 +54,15 @@ def find_quote_in_documents(
     if not quote or not documents:
         return None
 
-    normalized_quote = _normalize(quote)
-    if not normalized_quote:
+    # Clean the quote (remove tags, normalize)
+    search_text = _clean_quote(quote)
+    if not search_text:
         return None
 
-    # Try exact match first
+    # Try exact match first on normalized content
     for doc_id, doc in documents.items():
-        normalized_content = _normalize(doc.content)
-        pos = normalized_content.find(normalized_quote)
+        doc_content = _normalize(doc.content)
+        pos = doc_content.find(search_text)
         if pos != -1:
             return GroundedEvidence(
                 claim=quote,
@@ -62,19 +72,19 @@ def find_quote_in_documents(
             )
 
     # Try fuzzy match with sliding window (threshold 0.8)
-    quote_len = len(normalized_quote)
+    quote_len = len(search_text)
     best_match: Optional[GroundedEvidence] = None
     best_ratio = 0.0
 
     for doc_id, doc in documents.items():
-        normalized_content = _normalize(doc.content)
-        if len(normalized_content) < quote_len:
+        doc_content = _normalize(doc.content)
+        if len(doc_content) < quote_len:
             continue
 
         step = max(1, quote_len // 4)
-        for i in range(0, len(normalized_content) - quote_len + 1, step):
-            window = normalized_content[i:i + quote_len]
-            ratio = SequenceMatcher(None, normalized_quote, window).ratio()
+        for i in range(0, len(doc_content) - quote_len + 1, step):
+            window = doc_content[i:i + quote_len]
+            ratio = SequenceMatcher(None, search_text, window).ratio()
             if ratio > best_ratio and ratio >= 0.8:
                 best_ratio = ratio
                 best_match = GroundedEvidence(
@@ -117,19 +127,22 @@ def ground_evidence(
         # Try chunk-level grounding first for finer-grained source info (LANE C)
         found_in_chunk = False
         if chunks:
-            normalized_claim = _normalize(claim)
-            for chunk in chunks:
-                normalized_text = _normalize(chunk.text)
-                if normalized_claim in normalized_text:
-                    results.append(GroundedEvidence(
-                        claim=claim,
-                        source_document=chunk.source_doc_id,
-                        source_chunk=chunk.chunk_id,
-                        exact_quote=claim,
-                        page_number=chunk.page_number,
-                    ))
-                    found_in_chunk = True
-                    break
+            # CLEAN the claim first
+            search_claim = _clean_quote(claim)
+            if search_claim:
+                for chunk in chunks:
+                    normalized_text = _normalize(chunk.text)
+                    if search_claim in normalized_text:
+                        results.append(GroundedEvidence(
+                            claim=claim,
+                            source_document=chunk.source_doc_id,
+                            source_chunk=chunk.chunk_id,
+                            exact_quote=claim,
+                            page_number=chunk.page_number,
+                        ))
+                        found_in_chunk = True
+                        break
+
         
         if found_in_chunk:
             continue

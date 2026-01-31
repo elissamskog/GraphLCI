@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from schemas.contracts import (
+    AliasMap,
     DomainType,
     FocusedContext,
     GlobalContext,  # Deprecated
@@ -36,18 +37,21 @@ from schemas.contracts import (
     SeedNode,
     TargetedContext,
     TextChunk,
+    WeightedSeedSet,
+    ClaimDecomposition,
 )
 
 from planner.search_strategy_classifier import ClassificationInput, SearchStrategyClassifier
 from planner.target_extractor import ExtractionInput, TargetExtractor
 from planner.lane_router import LaneRouter, RoutingInput
 from planner.query_embedder import embed_query
-from planner.seed_finder import find_seed_nodes
+from planner.seed_finder import find_seed_nodes, find_seeds_multi_query, find_balanced_seeds, find_subclaim_seeds
 from planner.ppr_expander import personalized_pagerank, extract_scope
 from planner.context_assembler import (
     assemble_focused_context,
     assemble_targeted_context,
 )
+from planner.claim_decomposer import decompose_claim
 
 logger = logging.getLogger(__name__)
 
@@ -161,45 +165,126 @@ class PlannerControllerV5:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
         self.classifier = SearchStrategyClassifier(self.config)
+        self.decomposer_config = self.config.get('decomposition', {})
 
     def process(self, planner_input: PlannerInput) -> PlannerOutput:
-        """Run the full v5 planner pipeline."""
+        """Run the full v5 planner pipeline with Entity-Balanced Seed Selection."""
         query_text = planner_input.query.query_text
         query_id = planner_input.query.query_id
+        embedding_client = self.config['embedding_client']
 
         # Step 1: Embed query
-        embedding_client = self.config['embedding_client']
         query_embedding = embed_query(query_text, embedding_client)
 
-        # Step 2: Find seeds
-        seeds = find_seed_nodes(
-            query_embedding,
-            planner_input.similarity_index,
-            graph=planner_input.graph,
-            top_k=self.config.get('seed_top_k', 10),
-            threshold=self.config.get('seed_threshold', 0.5),
+        # Step 1.2: DECOMPOSE CLAIM (NEW - Two-Stage Architecture)
+        decomposition = None
+        llm_client = self.config.get('llm_client')  # Get LLM client from config
+        if self.decomposer_config.get('enable_decomposition', False):
+            decomposition = decompose_claim(
+                query_text=query_text,
+                llm_client=llm_client,
+                config=self.decomposer_config
+            )
+            logger.info(
+                f"Decomposition: should_decompose={decomposition.should_decompose}, "
+                f"subclaims={len(decomposition.subclaims)}, "
+                f"confidence={decomposition.confidence:.2f}"
+            )
+
+        # Step 1.5: Entity-Aware Seed Discovery
+        # Extract entities from query using TargetExtractor
+        extractor = TargetExtractor(self.config)
+        targets = extractor.extract(ExtractionInput(
+            query_text=query_text,
+            available_documents=[],
+            known_entities=self.config.get("known_entities", []),
+        ))
+        
+        logger.info(f"PLANNER Targets: explicit={targets.identified_targets.explicit_docs}, implicit={targets.identified_targets.implicit_entities}")
+
+        # Multi-vector search: embed each entity separately
+        entity_embeddings = []
+        for entity in targets.identified_targets.implicit_entities:
+            entity_embeddings.append(embed_query(entity, embedding_client))
+        
+        # Step 2: Find seeds with balanced seeding (Multi-Bucket Strategy)
+        # NEW: Multi-source weighted seeding if decomposition enabled
+        seed_weights = None
+        if decomposition and decomposition.should_decompose:
+            # Multi-source weighted seeding path
+            subclaim_seeds = find_subclaim_seeds(
+                subclaims=decomposition.subclaims,
+                similarity_index=planner_input.similarity_index,
+                graph=planner_input.graph,
+                embedding_client=embedding_client,
+                top_k_per_subclaim=5,
+                threshold=0.70,
+            )
+
+            subclaim_priorities = {
+                sc.subclaim_id: sc.priority for sc in decomposition.subclaims
+            }
+
+            weighted_seed_set = find_balanced_seeds(
+                global_embedding=query_embedding,
+                entity_embeddings=entity_embeddings,
+                similarity_index=planner_input.similarity_index,
+                graph=planner_input.graph,
+                top_k=self.config.get('seed_top_k', 12),
+                threshold=self.config.get('seed_threshold', 0.70),
+                global_quota=self.config.get('seed_global_quota', 3),
+                entity_quota=self.config.get('seed_entity_quota', 3),
+                entity_texts=targets.identified_targets.implicit_entities,
+                subclaim_seeds=subclaim_seeds,
+                subclaim_priorities=subclaim_priorities,
+            )
+
+            seeds = weighted_seed_set.seeds
+            seed_weights = self._compute_seed_weights(weighted_seed_set, decomposition)
+        else:
+            # Fallback to existing single-pass flow
+            weighted_seed_set = find_balanced_seeds(
+                global_embedding=query_embedding,
+                entity_embeddings=entity_embeddings,
+                similarity_index=planner_input.similarity_index,
+                graph=planner_input.graph,
+                top_k=self.config.get('seed_top_k', 12),
+                threshold=self.config.get('seed_threshold', 0.70),
+                global_quota=self.config.get('seed_global_quota', 3),
+                entity_quota=self.config.get('seed_entity_quota', 3),
+                entity_texts=targets.identified_targets.implicit_entities,
+            )
+            seeds = weighted_seed_set.seeds
+
+        # Step 3: Classify strategy (moved before PPR to inform alpha)
+        classification = self.classifier.classify(
+            ClassificationInput(query_text=query_text)
         )
 
-        # Step 3: PPR expand
+        # Step 4: PPR expand with query-adaptive damping
+        # Multihop/relational queries need higher alpha (more diffusion)
+        # to reach nodes 3-4 hops away. Lookup queries stay local.
+        # P1b: Also force alpha=0.85 for multi-entity queries (2+ entities).
         seed_ids = [s.node_id for s in seeds]
+        entity_count = len(targets.identified_targets.implicit_entities)
+        ppr_alpha = self._select_ppr_alpha(classification.strategy, entity_count)
         ppr_scores = personalized_pagerank(
             planner_input.graph,
             seed_ids,
-            alpha=self.config.get('ppr_alpha', 0.85),
+            alpha=ppr_alpha,
             max_iterations=self.config.get('ppr_max_iter', 50),
             tolerance=self.config.get('ppr_tolerance', 1e-6),
+            degree_discount=False,  # Disabled: P2b edge-level discount is sufficient
+            seed_weights=seed_weights,  # NEW: Pass weights for weighted PPR
         )
+
+        # Extract scope with hardened thresholds: min_score=0.035, top_k=15
         scope = extract_scope(
             planner_input.graph,
             ppr_scores,
             seed_ids,
-            top_k=self.config.get('scope_max_nodes', 50),
-            min_score=self.config.get('scope_min_score', 0.01),
-        )
-
-        # Step 4: Classify strategy (reuse v4 offline classifier)
-        classification = self.classifier.classify(
-            ClassificationInput(query_text=query_text)
+            top_k=self.config.get('scope_max_nodes', 25),
+            min_score=self.config.get('scope_min_score', 0.005),
         )
 
         # Step 5: Route lane (v5 rules)
@@ -213,19 +298,19 @@ class PlannerControllerV5:
             seed_nodes=seeds,
             scope=scope,
             confidence=classification.strategy.confidence,
+            claim_decomposition=decomposition,
         )
 
-        # Step 7: Assemble context (Aggregator Pattern)
-        # Always gather targeted context (Lane C) because it's cheap (vector lookup).
-        # Gather focused context (Lane A) if we have a valid scope.
-        
+        # Step 7: Assemble context (Aggregator Pattern) with AliasMap
         focused: Optional[FocusedContext] = None
         global_ctx: Optional[GlobalContext] = None
         targeted: Optional[TargetedContext] = None
+        focused_alias_map: Optional[AliasMap] = None
+        targeted_alias_map: Optional[AliasMap] = None
 
         # --- Lane A: Graph Context ---
         if planner_input.graph and scope and len(scope.nodes) > 0:
-            focused = assemble_focused_context(
+            focused, focused_alias_map = assemble_focused_context(
                 scope,
                 planner_input.graph,
                 planner_input.document_store or {},
@@ -233,7 +318,7 @@ class PlannerControllerV5:
 
         # --- Lane C: Vector Context ---
         chunks = self._gather_chunks(planner_input)
-        targeted = assemble_targeted_context(
+        targeted, targeted_alias_map = assemble_targeted_context(
             scope,
             chunks,
             query_embedding,
@@ -241,19 +326,14 @@ class PlannerControllerV5:
 
         # --- De-duplication: Prioritize Graph Context ---
         if focused and targeted and targeted.chunks:
-            # De-duplication: Prioritize Graph Context
-            # Gather chunk IDs already covered by graph nodes in focused context
             covered_chunk_ids = set()
             if planner_input.graph and getattr(planner_input.graph, "nodes", None):
-                # v5 KnowledgeGraph has 'nodes' dict
                 for node_id in scope.nodes:
-                    # Look up full node in graph to get source_chunks
                     graph_node = planner_input.graph.nodes.get(node_id)
                     if graph_node and hasattr(graph_node, "source_chunks"):
                         for cid in graph_node.source_chunks:
                             covered_chunk_ids.add(cid)
             
-            # Filter targeted context chunks
             if covered_chunk_ids:
                 unique_chunks = [
                     c for c in targeted.chunks 
@@ -261,22 +341,112 @@ class PlannerControllerV5:
                 ]
                 targeted.chunks = unique_chunks
 
+        # --- Merge alias maps ---
+        merged_mappings = {}
+        if focused_alias_map:
+            merged_mappings.update(focused_alias_map.mappings)
+        if targeted_alias_map:
+            merged_mappings.update(targeted_alias_map.mappings)
+        
+        final_alias_map = AliasMap(mappings=merged_mappings) if merged_mappings else None
+
         return PlannerOutput(
             router_decision=router_decision,
             focused_context=focused,
             global_context=global_ctx,
             targeted_context=targeted,
+            alias_map=final_alias_map,
         )
+
+    # --- Multihop strategies that need longer PPR walks ---
+    _MULTIHOP_STRATEGIES = frozenset({
+        SearchStrategyType.COMPARISON,
+        SearchStrategyType.EVIDENCE_SYNTHESIS,
+        SearchStrategyType.METHODOLOGY_COMPARISON,
+        SearchStrategyType.CONTRADICTION_DETECTION,
+    })
+
+    def _select_ppr_alpha(
+        self,
+        strategy: SearchStrategyClassification,
+        entity_count: int = 0,
+    ) -> float:
+        """Choose PPR damping factor based on query strategy and entity count.
+
+        Multi-entity queries (2+ entities) always use alpha=0.85 for longer
+        diffusion, even if classified as LOOKUP. This handles cases like
+        "Clara Vance was born in Oxford" (2 entities, spans 2 docs).
+
+        Multihop/relational queries use alpha=0.85 (longer walks, ~52%
+        chance of reaching 4-hop nodes). Lookup/verification queries
+        use alpha=0.65 (tighter locality, ~18% at 4 hops).
+        """
+        if self.config.get('ppr_alpha') is not None:
+            return self.config['ppr_alpha']  # explicit override wins
+
+        # P1b: Force multihop alpha for multi-entity queries
+        if entity_count >= 2:
+            return self.config.get('ppr_alpha_multihop', 0.85)
+
+        if strategy.classification in self._MULTIHOP_STRATEGIES:
+            return self.config.get('ppr_alpha_multihop', 0.85)
+        return self.config.get('ppr_alpha_local', 0.65)
+
+    def _compute_seed_weights(
+        self,
+        weighted_seed_set: WeightedSeedSet,
+        decomposition: ClaimDecomposition
+    ) -> Dict[str, float]:
+        """Compute PPR initial weights based on subclaim priority.
+
+        Priority multipliers:
+        - primary: 2.0x (main subject claims)
+        - bridge: 1.5x (connecting entities)
+        - secondary: 1.0x (supporting claims)
+
+        Args:
+            weighted_seed_set: The weighted seed set with node IDs
+            decomposition: The claim decomposition with subclaims
+
+        Returns:
+            Dict mapping node_id to initial weight for PPR
+        """
+        PRIORITY_WEIGHTS = {
+            "primary": self.decomposer_config.get('primary_weight_multiplier', 2.0),
+            "bridge": self.decomposer_config.get('bridge_weight_multiplier', 1.5),
+            "secondary": 1.0,
+        }
+
+        weights: Dict[str, float] = {}
+
+        # Build node_id -> priority mapping
+        node_to_priority: Dict[str, str] = {}
+
+        # Map primary nodes
+        for node_id in weighted_seed_set.primary_node_ids:
+            node_to_priority[node_id] = "primary"
+
+        # Map bridge nodes
+        for node_id in weighted_seed_set.bridge_node_ids:
+            node_to_priority[node_id] = "bridge"
+
+        # Assign weights to all seeds
+        for seed in weighted_seed_set.seeds:
+            priority = node_to_priority.get(seed.node_id, "secondary")
+            weights[seed.node_id] = PRIORITY_WEIGHTS[priority]
+
+        return weights
 
     def _route_v5(
         self, strategy: SearchStrategyClassification, scope: Scope,
     ) -> LaneType:
         """V5 routing rules.
 
-        - COMPARISON -> LANE_A
-        - LOOKUP -> LANE_C
-        - Override: if scope has < 5 nodes -> LANE_C
-        - Low confidence fallback -> LANE_C
+        - Low confidence or sparse scope -> LANE_C (Vector Only)
+        - Otherwise -> LANE_A (Graph LCI)
+        
+        This enables structural reasoning for LOOKUP and CLAIM_VERIFICATION
+        when the graph provides a sufficient scope.
         """
         confidence_threshold = self.config.get('confidence_threshold', 0.7)
         if strategy.confidence < confidence_threshold:
@@ -286,16 +456,10 @@ class PlannerControllerV5:
         if node_count < 5:
             return LaneType.LANE_C_VECTOR_ONLY
 
-        strategy_type = strategy.classification
+        # Default to Lane A (Graph LCI) if we have a valid scope and high confidence,
+        # regardless of strategy type. Graph structure aids all reasoning tasks.
+        return LaneType.LANE_A_GRAPH_LCI
 
-        if strategy_type == SearchStrategyType.COMPARISON:
-            return LaneType.LANE_A_GRAPH_LCI
-
-        if strategy_type == SearchStrategyType.LOOKUP:
-            return LaneType.LANE_C_VECTOR_ONLY
-            
-        # Fallback for others (CLAIM_VERIFICATION, CONTRADICTION_DETECTION)
-        return LaneType.LANE_C_VECTOR_ONLY
 
     def _gather_chunks(self, planner_input: PlannerInput) -> List[TextChunk]:
         """Gather TextChunks — prefer real chunks from chunker, fall back to document_store."""
