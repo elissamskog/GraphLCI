@@ -164,3 +164,74 @@ def _parse_line_format(raw: str, chunk: TextChunk) -> List[ExtractedEntity]:
         )
 
     return entities
+
+
+def extract_entities_batch(
+    llm_client,
+    chunks: List[TextChunk],
+    schema: Optional[Dict[str, Any]] = None,
+    num_ctx: Optional[int] = None,
+) -> List[List[ExtractedEntity]]:
+    """Extract entities from multiple chunks in one or more LLM calls."""
+    # Simple implementation: loop over extract_entities
+    # Future optimization: batch prompt for MLX/Ollama
+    results = []
+    for chunk in chunks:
+        results.append(extract_entities(llm_client, chunk, schema, num_ctx))
+    return results
+
+
+def refine_entities_batch(
+    llm_client,
+    chunks: List[TextChunk],
+    batch_entities: List[List[ExtractedEntity]],
+    num_ctx: Optional[int] = None,
+) -> List[List[ExtractedEntity]]:
+    """Schema-Guided Refinement: targeted extraction for specific entity types.
+    
+    Identifies high-value entities (e.g., CreativeWork, TV Series) and triggers
+    a targeted pass to extract missing critical attributes.
+    """
+    refined_results: List[List[ExtractedEntity]] = [[] for _ in chunks]
+    
+    # Types that benefit from extra schema-guided extraction
+    REFINE_TYPES = {"CREATIVEWORK", "TV SERIES", "MOVIE", "ORGANIZATION", "PERSON"}
+    
+    for i, (chunk, entities) in enumerate(zip(chunks, batch_entities)):
+        to_refine = [e for e in entities if e.entity_type.upper() in REFINE_TYPES]
+        if not to_refine:
+            continue
+            
+        # Build a refinement prompt
+        refine_prompts = []
+        for entity in to_refine:
+            refine_prompts.append(
+                f"- For the {entity.entity_type} '{entity.surface_form}', extract critical attributes "
+                f"(e.g., Network, Creator, Founder, Occupation, Date of Birth)."
+            )
+            
+        prompt = (
+            "Refine the following entity extractions from the provided text.\n"
+            "For each targeted entity, extract ANY missing factual attributes as NEW entities.\n\n"
+            "TARGETED ENTITIES:\n" + "\n".join(refine_prompts) + "\n\n"
+            "Return ONLY a JSON array of objects:\n"
+            '  {"sf": "attribute value", "t": "attribute type", "d": "context description"}\n\n'
+            f"--- TEXT ({chunk.chunk_id}) ---\n"
+            f"{chunk.text}\n"
+        )
+        
+        try:
+            raw_response = llm_client.generate(prompt, num_ctx=num_ctx)
+            extra_entities = _parse_response(raw_response, chunk)
+            # Tag them as refined
+            for ee in extra_entities:
+                if not ee.description:
+                    ee.description = "Refined attribute"
+                else:
+                    ee.description = f"Refined: {ee.description}"
+            refined_results[i] = extra_entities
+        except Exception:
+            # Fallback for LLM failure during refinement
+            continue
+            
+    return refined_results
